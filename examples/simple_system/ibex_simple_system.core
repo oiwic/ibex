@@ -132,6 +132,12 @@ parameters:
     default: 40
     description: Bit width of performance monitor event counters [32/64]
 
+  TIDE_EN_SYS:
+    datatype: int
+    paramtype: vlogparam
+    default: 0
+    description: "Enable TIDE-ISA CD logic in this system (no DD side, channel pins wired idle) [0/1]"
+
 targets:
   default: &default_target
     filesets:
@@ -158,9 +164,14 @@ targets:
       - MHPMCounterNum
       - MHPMCounterWidth
       - SRAMInitFile
+      - TIDE_EN_SYS
 
   lint:
     <<: *default_target
+    # Lint with TIDE enabled so the TIDE CD logic is elaborated and checked
+    # (with TIDE_EN=0 the TIDE code is elided and never linted).
+    parameters:
+      - TIDE_EN_SYS=1
     default_tool: verilator
     tools:
       verilator:

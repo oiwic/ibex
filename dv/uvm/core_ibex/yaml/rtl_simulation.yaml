@@ -21,6 +21,14 @@
   env_var: IBEX_ROOT, EXTRA_COSIM_CFLAGS
   compile:
     cmd:
+      # VCS O-2018.09 compatibility (no +define+SYNTHESIS here): ibex_dv.f
+      # prepends an include dir that shadows the lowRISC standard-assertion
+      # macros with concurrent-assertion-only equivalents (this VCS build
+      # cannot parse immediate assertions). SYNTHESIS is avoided because it
+      # would also disable the DV_FCOV macros the functional-coverage
+      # interface needs. The -Wno-error=int-conversion Xcflags entry from
+      # upstream is dropped too: it is unknown to the container's gcc-7
+      # and VCS turns that unknown-option diagnostic into a hard error.
       - >-
         vcs
           -full64
@@ -39,9 +47,9 @@
           -debug_access+pp
           -xlrm uniq_prior_final
           -CFLAGS '--std=c99 -fno-extended-identifiers'
-          -lca -kdb
+          -lca -nogenid_db
           -debug_access+f
-          -Xcflags='-Wno-error=implicit-function-declaration -Wno-error=int-conversion'
+          -Xcflags='-Wno-error=implicit-function-declaration'
           <cmp_opts> <wave_opts> <cov_opts> <cosim_opts>
     cov_opts: >-
       -cm line+tgl+assert+fsm+branch

@@ -5,3 +5,6 @@
 ${PRJ_DIR}/dv/uvm/core_ibex/common/ibex_cosim_agent/spike_cosim_dpi.cc
 ${PRJ_DIR}/dv/cosim/cosim_dpi.cc
 ${PRJ_DIR}/dv/cosim/spike_cosim.cc
+// glibc/libstdc++ link shims for the prebuilt spike archives in the
+// shared EDA container (see the file header for details).
+${PRJ_DIR}/dv/cosim/spike_glibc_shim.cc

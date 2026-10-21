@@ -7,7 +7,7 @@
  * Top level module of the ibex RISC-V core with tracing enabled
  */
 
-module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
+module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide_pkg::*; #(
   parameter base_isa_e   BaseIsa                   = BaseIsaRV32I,
   parameter bit          PMPEnable                 = 1'b0,
   parameter int unsigned PMPGranularity            = 0,
@@ -26,6 +26,7 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   parameter bit          ICacheTweakInfection      = 1'b0,
   parameter bit          BranchPredictor           = 1'b0,
   parameter bit          DbgTriggerEn              = 1'b0,
+  parameter bit          TIDE_EN                   = 1'b0,
   parameter int unsigned DbgHwBreakNum             = 1,
   parameter bit          SecureIbex                = 1'b0,
   parameter int unsigned LockstepOffset            = 1,
@@ -132,7 +133,24 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
 
   // Shadow core instruction interface outputs
   output logic                                                        instr_req_shadow_o,
-  output logic [31:0]                                                 instr_addr_shadow_o
+  output logic [31:0]                                                 instr_addr_shadow_o,
+
+  // TIDE-ISA v0.10-rc4 CD<->DD boundary (ch09 section 3; ch10 section 3.3).
+  // Gated by TIDE_EN inside the core; idles when the DD side is not driven.
+  output ibex_tide_pkg::tide_enq_req_t  tide_enq_req_o,
+  input  ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp_i,
+  output ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_o,
+  input  ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp_i,
+  output ibex_tide_pkg::tide_sync_req_t tide_sync_req_o,
+  input  logic                          tide_sync_anchor_i,
+  input  logic                          tide_gc_realign_i,
+  input  ibex_tide_pkg::tide_trap_t     tide_trap_i,
+  input  logic                          tide_halt_i,
+  output ibex_tide_pkg::tide_csr_req_t  tide_csr_req_o,
+  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i,
+  output ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_o,
+  input  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_i
+
 );
 
   // ibex_tracer relies on the signals from the RISC-V Formal Interface
@@ -252,7 +270,8 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .DmHaltAddr                ( DmHaltAddr                ),
     .DmExceptionAddr           ( DmExceptionAddr           ),
     .CheriotRevBitmapAddrWidth ( CheriotRevBitmapAddrWidth ),
-    .CheriotRevBitmapBaseAddr  ( CheriotRevBitmapBaseAddr  )
+    .CheriotRevBitmapBaseAddr  ( CheriotRevBitmapBaseAddr  ),
+    .TIDE_EN                   ( TIDE_EN                   )
   ) u_ibex_top (
     .clk_i,
     .rst_ni,
@@ -378,7 +397,21 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .data_wdata_intg_shadow_o,
 
     .instr_req_shadow_o,
-    .instr_addr_shadow_o
+    .instr_addr_shadow_o,
+    // TIDE-ISA v0.10-rc4 CD<->DD boundary
+    .tide_enq_req_o,
+    .tide_enq_rsp_i,
+    .tide_rq_pop_o,
+    .tide_rq_rsp_i,
+    .tide_sync_req_o,
+    .tide_sync_anchor_i,
+    .tide_gc_realign_i,
+    .tide_trap_i,
+    .tide_halt_i,
+    .tide_csr_req_o,
+    .tide_csr_rsp_i,
+    .tide_mmio_req_o,
+    .tide_mmio_rsp_i
   );
 
 `ifdef RVFI

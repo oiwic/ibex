@@ -2,7 +2,9 @@
 # Licensed under the Apache License, Version 2.0, see LICENSE for details.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import subprocess
+from pathlib import Path
 from typing import Tuple, Dict, List
 from typeguard import typechecked
 
@@ -32,7 +34,10 @@ class GenError(Exception):
 
 def _run_ibex_config(config_name: str, output_type: str) -> str:
     script_path = _IBEX_ROOT/'util'/'ibex_config.py'
-    yaml_path = _IBEX_ROOT/'ibex_configs.yaml'
+    cfg_file = os.environ.get('IBEX_CONFIG_FILE', 'ibex_configs.yaml')
+    yaml_path = Path(cfg_file)
+    if not yaml_path.is_absolute():
+        yaml_path = _IBEX_ROOT / yaml_path
 
     ibex_config_cmd = [
         str(script_path),
@@ -87,7 +92,10 @@ def get_sim_opts(config_name: str, simulator: str) -> str:
 
 
 def get_config(cfg_name: str) -> Config:
-    yaml_path = _IBEX_ROOT/"ibex_configs.yaml"
+    cfg_file = os.environ.get("IBEX_CONFIG_FILE", "ibex_configs.yaml")
+    yaml_path = Path(cfg_file)
+    if not yaml_path.is_absolute():
+        yaml_path = _IBEX_ROOT / yaml_path
     return parse_config(cfg_name, yaml_path)
 
 

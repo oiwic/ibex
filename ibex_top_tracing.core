@@ -97,6 +97,12 @@ parameters:
     default: 0
     paramtype: vlogparam
     description: "Enable support for debug triggers. "
+  TIDE_EN:
+    datatype: int
+    default: 0
+    paramtype: vlogparam
+    description: "Enable TIDE-ISA CD-side logic (TIDE channels; DD boundary idles when not connected) [0/1]"
+
 
   SecureIbex:
     datatype: int

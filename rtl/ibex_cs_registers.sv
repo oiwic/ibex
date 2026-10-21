@@ -10,7 +10,7 @@
 
 `include "prim_assert.sv"
 
-module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
+module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*, ibex_tide_pkg::*; #(
   parameter base_isa_e              BaseIsa                     = BaseIsaRV32I,
   parameter bit                     DbgTriggerEn                = 0,
   parameter int unsigned            DbgHwBreakNum               = 1,
@@ -32,7 +32,18 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
   // mvendorid: encoding of manufacturer/provider
   parameter logic [31:0]            CsrMvendorId                = 32'b0,
   // mimpid: encoding of processor implementation version
-  parameter logic [31:0]            CsrMimpId                   = 32'b0
+  parameter logic [31:0]            CsrMimpId                   = 32'b0,
+
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN). Build parameters mirror the
+  // frozen tide_cd_top surface (tide_doc/chapters/10-implementation-plan.md
+  // section 3.3) and drive the WARL readback of tqcfg/tqfdom/tqsynccap.
+  parameter bit TIDE_EN             = 1'b0,
+  parameter int NCH                 = 16,
+  parameter int NRQ                 = 16,
+  parameter int TQ_DEPTH            = 32,
+  parameter int RQ_DEPTH            = 4,
+  parameter int TQ_GUARD            = 8,
+  parameter int NSYNC_SET           = 16
 ) (
   // Clock and Reset
   input  logic                 clk_i,
@@ -156,7 +167,19 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
   output decoded_cap_t         pcc_cap_o,
 
   output logic                 csr_dbg_tclr_fault_o,
-  output logic                 cheriot_fatal_err_o
+  output logic                 cheriot_fatal_err_o,
+
+  // TIDE-ISA v0.10-rc4 CSR surface (ISA section 5; ch09 section 5; gated
+  // by TIDE_EN). The CD keeps readback copies of the RW CSRs and forwards
+  // the DD-owned subset over the frozen CSR split bus (always-ready,
+  // 1-cycle, combinational read; tide_doc/chapters/10-implementation-plan.md
+  // section 3.3).
+  input  logic [47:0]                      tide_tlr_i,
+  input  ibex_tide_pkg::tide_trap_ctx_t    tide_trap_ctx_i,
+  output logic [31:0]                      tide_tqrty_o,
+  output logic [31:0]                      tide_tqsyt_o,
+  output ibex_tide_pkg::tide_csr_req_t     tide_csr_req_o,
+  input  ibex_tide_pkg::tide_csr_rsp_t     tide_csr_rsp_i
 );
 
   // Is a PMP config a locked one that allows M-mode execution when MSECCFG.MML is set (either
@@ -349,6 +372,36 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
   logic        illegal_csr_priv;
   logic        illegal_csr_dbg;
   logic        illegal_csr_write;
+
+  // TIDE-ISA v0.10-rc4: RW configuration state (ISA section 5.2). The CD
+  // keeps the readback copy; the DD mirrors the forwarded subset (tqcfg
+  // bit29, tqerr_policy, tqidx, tqsink) plus the W1S actions.
+  logic        tide_tqcfg_nb_we;
+  logic        tide_tqcfg_nb_d;
+  logic        tide_tqcfg_nb_q;
+  logic        tide_tqrty_we;
+  logic [31:0] tide_tqrty_d;
+  logic [31:0] tide_tqrty_q;
+  logic        tide_tqsyt_we;
+  logic [31:0] tide_tqsyt_d;
+  logic [31:0] tide_tqsyt_q;
+  logic        tide_tqerr_policy_we;
+  logic [31:0] tide_tqerr_policy_d;
+  logic [31:0] tide_tqerr_policy_q;
+  logic        tide_tqidx_we;
+  logic [7:0]  tide_tqidx_d;
+  logic [7:0]  tide_tqidx_q;
+  logic        tide_tqsink_we;
+  logic [31:0] tide_tqsink_d;
+  logic [31:0] tide_tqsink_q;
+  // trap snapshot (latched at trap save; fault words refresh on tqcause
+  // read, ISA section 5.1)
+  ibex_tide_pkg::tide_trap_ctx_t tide_trap_snap_q;
+  logic [31:0] tide_tqfault_q;
+  logic [31:0] tide_tqfaulth_q;
+  logic [31:0] tide_fault_next;
+  logic        tide_csr_fwd_write;
+  logic        tide_csr_fwd_read;
 
   logic [7:0]  unused_boot_addr;
   logic [2:0]  unused_csr_addr;
@@ -662,14 +715,28 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
 
       // Custom CSR for controlling CPU features and reporting CPU status
       CSR_CPUCTRLSTS: begin
-        csr_rdata_int = {{32 - $bits(cpu_ctrl_sts_part_t) - 1 {1'b0}},
-                         cpuctrlsts_ic_scr_key_valid_q,
-                         cpuctrlsts_part_q};
+        if (TIDE_EN) begin
+          // TIDE-ISA: tqcfg (ISA section 5.2). WARL: only bit29 (non-
+          // blocking enqueue) is writable; [28:0] reads back build
+          // parameters.
+          csr_rdata_int = {2'b0, tide_tqcfg_nb_q, 6'(NRQ), 6'(NCH),
+                           4'($clog2(RQ_DEPTH)), 5'($clog2(TQ_DEPTH)),
+                           8'(TQ_GUARD)};
+        end else begin
+          csr_rdata_int = {{32 - $bits(cpu_ctrl_sts_part_t) - 1 {1'b0}},
+                           cpuctrlsts_ic_scr_key_valid_q,
+                           cpuctrlsts_part_q};
+        end
       end
 
       // Custom CSR for LFSR re-seeding (cannot be read)
       CSR_SECURESEED: begin
-        csr_rdata_int = '0;
+        if (TIDE_EN) begin
+          // TIDE-ISA: tqrty, QLOAD timeout threshold (ISA section 5.2)
+          csr_rdata_int = tide_tqrty_q;
+        end else begin
+          csr_rdata_int = '0;
+        end
       end
 
       // MSHWM CSR (stack high watermark in cheriot)
@@ -692,6 +759,133 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
       CSR_CDBG_CTRL: begin
         if (cheriot_enable_i == IbexMuBiOn) begin
           csr_rdata_int = cdbg_ctrl_q;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+
+      // TIDE-ISA v0.10-rc4 section 5.1/5.2 (illegal when TIDE_EN=0)
+      CSR_TQSYT: begin
+        if (TIDE_EN) begin
+          // tqsyt, QSYNC timeout threshold (ISA section 5.2)
+          csr_rdata_int = tide_tqsyt_q;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQHALT_REQ: begin
+        if (TIDE_EN) begin
+          // W1S fail-stop request: reads as zero (ISA section 5.2)
+          csr_rdata_int = '0;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQERR_POLICY: begin
+        if (TIDE_EN) begin
+          csr_rdata_int = tide_tqerr_policy_q;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQIDX: begin
+        if (TIDE_EN) begin
+          csr_rdata_int = {24'b0, tide_tqidx_q};
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQSINK: begin
+        if (TIDE_EN) begin
+          csr_rdata_int = tide_tqsink_q;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQFLUSH: begin
+        if (TIDE_EN) begin
+          // W1S halt-recovery flush: reads as zero (ISA section 5.2)
+          csr_rdata_int = '0;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      // DD-managed RO CSRs: combinational readback over the CSR split
+      // bus (rsp is valid in the request cycle, frozen adapter protocol)
+      CSR_TQGC,
+      CSR_TQGCH,
+      CSR_TQSTATE,
+      CSR_TQRDATA,
+      CSR_TQSCHEMA,
+      CSR_TQHEAD,
+      CSR_TQHEADH: begin
+        if (TIDE_EN) begin
+          csr_rdata_int = tide_csr_rsp_i.rdata;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQTLR: begin
+        if (TIDE_EN) begin
+          // per-hart TLR low (id_stage timeline, debug only, ISA 5.1)
+          csr_rdata_int = tide_tlr_i[31:0];
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQTLRH: begin
+        if (TIDE_EN) begin
+          csr_rdata_int = {16'b0, tide_tlr_i[47:32]};
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQFDOM: begin
+        if (TIDE_EN) begin
+          // [7:0] fault domain id, [15:8] harts in domain (Version A:
+          // single domain, single hart)
+          csr_rdata_int = {16'b0, 8'd1, 8'd0};
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQRES: begin
+        if (TIDE_EN) begin
+          // dispatch clock frequency in kHz (ISA section 5.1)
+          csr_rdata_int = ibex_tide_pkg::TQ_RES_KHZ;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQSYNCCAP: begin
+        if (TIDE_EN) begin
+          // [15:0] active sync-set capacity; [16] runtime regrouping
+          csr_rdata_int = {15'b0, 1'b0, 16'(NSYNC_SET)};
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQCAUSE: begin
+        if (TIDE_EN) begin
+          // [3:0] TQ_* ordinal, [5:4] detection class (ISA section 5.1)
+          csr_rdata_int = {26'b0, tide_trap_snap_q.trap_class,
+                           tide_trap_snap_q.tqcause};
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQFAULT: begin
+        if (TIDE_EN) begin
+          // fault scene word 0 (latched on tqcause read, ISA 5.1)
+          csr_rdata_int = tide_tqfault_q;
+        end else begin
+          illegal_csr = 1'b1;
+        end
+      end
+      CSR_TQFAULTH: begin
+        if (TIDE_EN) begin
+          // fault scene word 1 (latched on tqcause read, ISA 5.1)
+          csr_rdata_int = tide_tqfaulth_q;
         end else begin
           illegal_csr = 1'b1;
         end
@@ -870,8 +1064,16 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
         end
 
         CSR_CPUCTRLSTS: begin
-          cpuctrlsts_part_d  = cpuctrlsts_part_wdata;
-          cpuctrlsts_part_we = 1'b1;
+          if (TIDE_EN) begin
+            // TIDE-ISA: tqcfg - WARL, only bit29 (non-blocking enqueue)
+            // is writable (ISA section 5.2); the DD mirrors it over the
+            // CSR split bus (derived in gen_tide_csr_req).
+            tide_tqcfg_nb_we = 1'b1;
+            tide_tqcfg_nb_d  = csr_wdata_int[29];
+          end else begin
+            cpuctrlsts_part_d  = cpuctrlsts_part_wdata;
+            cpuctrlsts_part_we = 1'b1;
+          end
         end
 
         CSR_MSHWM:     mshwm_en     = (BaseIsa == BaseIsaRV32IorCHERIoT)
@@ -880,6 +1082,55 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
                                     & (cheriot_enable_i == IbexMuBiOn);
         CSR_CDBG_CTRL: cdbg_ctrl_en = (BaseIsa == BaseIsaRV32IorCHERIoT)
                                     & (cheriot_enable_i == IbexMuBiOn);
+
+        // TIDE-ISA v0.10-rc4 section 5.2 (TIDE_EN gated). The W1S
+        // actions (tqhalt_req / tqflush) are forwarded as bus writes;
+        // the DD owns the action. Writes to the RO 0xFC0-0xFCF range
+        // are rejected by the standard illegal_csr_write path.
+        CSR_SECURESEED: begin
+          if (TIDE_EN) begin
+            // TIDE-ISA: tqrty (QLOAD timeout); stays CD-local - the
+            // timeout counter lives in the ID stage (ch10 section 5.1)
+            tide_tqrty_we = 1'b1;
+            tide_tqrty_d  = csr_wdata_int;
+          end
+        end
+        CSR_TQSYT: begin
+          if (TIDE_EN) begin
+            // TIDE-ISA: tqsyt (QSYNC timeout); CD-local
+            tide_tqsyt_we = 1'b1;
+            tide_tqsyt_d  = csr_wdata_int;
+          end
+        end
+        CSR_TQHALT_REQ: begin
+          if (TIDE_EN) begin
+            // W1S: the write itself is the fail-stop request (ISA 6.2);
+            // forwarded over the bus, action performed by the DD.
+          end
+        end
+        CSR_TQERR_POLICY: begin
+          if (TIDE_EN) begin
+            tide_tqerr_policy_we = 1'b1;
+            tide_tqerr_policy_d  = csr_wdata_int;
+          end
+        end
+        CSR_TQIDX: begin
+          if (TIDE_EN) begin
+            tide_tqidx_we = 1'b1;
+            tide_tqidx_d  = csr_wdata_int[7:0];
+          end
+        end
+        CSR_TQSINK: begin
+          if (TIDE_EN) begin
+            tide_tqsink_we = 1'b1;
+            tide_tqsink_d  = csr_wdata_int;
+          end
+        end
+        CSR_TQFLUSH: begin
+          if (TIDE_EN) begin
+            // W1S: forwarded; the DD enforces halted == 1 (ISA 6.3 P6')
+          end
+        end
 
         default:;
       endcase
@@ -979,6 +1230,99 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
 
       default:;
     endcase
+  end
+
+  // TIDE-ISA v0.10-rc4: RW configuration state, trap snapshot, and the
+  // CSR split bus to the DD (ISA section 5; ch10 section 3.3/5.1).
+  assign tide_tqrty_o = tide_tqrty_q;
+  assign tide_tqsyt_o = tide_tqsyt_q;
+
+  // tqfault encoding (ISA section 5.1): timing-class errors carry the
+  // offending event's ts' low word; TQ_SYNC_ERR carries the gid; the two
+  // timeouts carry the queue/group number.
+  always_comb begin : gen_tide_fault
+    tide_fault_next = tide_trap_snap_q.ts[31:0];
+    unique case (tide_trap_snap_q.tqcause)
+      TideTqCauseSyncErr: tide_fault_next = tide_trap_snap_q.gid;
+      TideTqCauseRdyTimeout,
+      TideTqCauseSyncTimeout: tide_fault_next = {27'd0, tide_trap_snap_q.target_idx};
+      default:;
+    endcase
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin : update_tide_csr
+    if (!rst_ni) begin
+      tide_tqcfg_nb_q     <= 1'b0;
+      tide_tqrty_q        <= ibex_tide_pkg::TQ_RTY_TIMEOUT_RST;
+      tide_tqsyt_q        <= ibex_tide_pkg::TQ_SYT_TIMEOUT_RST;
+      tide_tqerr_policy_q <= ibex_tide_pkg::TQERR_POLICY_RST;
+      tide_tqidx_q        <= 8'd0;
+      tide_tqsink_q       <= 32'd0;
+      tide_trap_snap_q    <= '{valid: 1'b0, trap_class: TideTrapClassSync,
+                               tqcause: TideTqCauseLate, target_is_queue: 1'b0,
+                               target_idx: 5'd0, ts: 48'd0, gid: 32'd0};
+      tide_tqfault_q      <= 32'd0;
+      tide_tqfaulth_q     <= 32'd0;
+    end else if (TIDE_EN) begin
+      if (tide_tqcfg_nb_we)     tide_tqcfg_nb_q   <= tide_tqcfg_nb_d;
+      if (tide_tqrty_we)        tide_tqrty_q      <= tide_tqrty_d;
+      if (tide_tqsyt_we)        tide_tqsyt_q      <= tide_tqsyt_d;
+      if (tide_tqerr_policy_we) tide_tqerr_policy_q <= tide_tqerr_policy_d;
+      if (tide_tqidx_we)        tide_tqidx_q      <= tide_tqidx_d;
+      if (tide_tqsink_we)       tide_tqsink_q     <= tide_tqsink_d;
+
+      // trap snapshot: latched when the TIDE trap cause is saved (all
+      // TQ_* traps share mcause = 24, ISA section 5.4); the context is
+      // valid for the save cycle (controller tide_trap_ctx_o).
+      if (csr_save_cause_i & ~debug_csr_save_i &
+          (csr_mcause_i.lower_cause == 5'd24) & tide_trap_ctx_i.valid) begin
+        tide_trap_snap_q <= tide_trap_ctx_i;
+      end
+
+      // fault scene words refresh on tqcause reads (ISA section 5.1)
+      if (csr_op_en_i & ~illegal_csr_insn_o &
+          (csr_addr_i == CSR_TQCAUSE)) begin
+        tide_tqfault_q  <= tide_fault_next;
+        tide_tqfaulth_q <= {10'b0, tide_trap_snap_q.target_is_queue,
+                            tide_trap_snap_q.target_idx,
+                            tide_trap_snap_q.ts[47:32]};
+      end
+    end
+  end
+
+  // CSR split bus request (frozen adapter protocol: always-ready, 1-cycle,
+  // combinational read; rsp valid in the request cycle). Forwarded writes:
+  // tqcfg (bit29), tqerr_policy, tqidx, tqsink, and the W1S actions
+  // tqhalt_req / tqflush. tqrty / tqsyt stay CD-local (the timeout
+  // counters live in the ID stage, ch10 section 5.1).
+  assign tide_csr_fwd_write = csr_we_int &
+      (csr_addr_i inside {CSR_CPUCTRLSTS, CSR_TQHALT_REQ, CSR_TQERR_POLICY,
+                          CSR_TQIDX, CSR_TQSINK, CSR_TQFLUSH});
+  assign tide_csr_fwd_read  = (csr_addr_i inside {CSR_TQGC, CSR_TQGCH,
+                                                  CSR_TQSTATE, CSR_TQRDATA,
+                                                  CSR_TQSCHEMA, CSR_TQHEAD,
+                                                  CSR_TQHEADH});
+
+  always_comb begin : gen_tide_csr_req
+    tide_csr_req_o = '{valid: 1'b0, write: 1'b0, addr: 12'd0, wdata: 32'd0,
+                       tlr: 48'd0};
+    if (TIDE_EN) begin
+      if (tide_csr_fwd_write) begin
+        tide_csr_req_o.valid  = 1'b1;
+        tide_csr_req_o.write  = 1'b1;
+        tide_csr_req_o.addr   = 12'(csr_addr_i);
+        tide_csr_req_o.wdata  = csr_wdata_int;
+      end else if (csr_op_en_i & ~illegal_csr_insn_o & tide_csr_fwd_read) begin
+        tide_csr_req_o.valid  = 1'b1;
+        tide_csr_req_o.write  = 1'b0;
+        tide_csr_req_o.addr   = 12'(csr_addr_i);
+        tide_csr_req_o.wdata  = 32'd0;
+        // ADR C15: gamma = TLR - elapsed (0xFC9/0xFCA) needs the
+        // CD-local TLR; the DD uses it on those reads, ignores it
+        // on all others.
+        tide_csr_req_o.tlr    = tide_tlr_i;
+      end
+    end
   end
 
   // Update current priv level
@@ -1909,7 +2253,7 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*; #(
     assign cpuctrlsts_part_wdata.dummy_instr_mask = cpuctrlsts_part_wdata_raw.dummy_instr_mask;
 
     // Signal a write to the seed register
-    assign dummy_instr_seed_en_o = csr_we_int && (csr_addr == CSR_SECURESEED);
+    assign dummy_instr_seed_en_o = csr_we_int && ~TIDE_EN && (csr_addr == CSR_SECURESEED);
     assign dummy_instr_seed_o    = csr_wdata_int;
 
   end else begin : gen_no_dummy

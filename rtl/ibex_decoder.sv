@@ -14,7 +14,11 @@ module ibex_decoder import ibex_cheriot_pkg::*; #(
   parameter ibex_pkg::rv32m_e RV32M = ibex_pkg::RV32MFast,
   parameter ibex_pkg::rv32b_e RV32B = ibex_pkg::RV32BNone,
   parameter bit BranchTargetALU     = 0,
-  parameter ibex_pkg::base_isa_e BaseIsa        = ibex_pkg::BaseIsaRV32IorCHERIoT
+  parameter ibex_pkg::base_isa_e BaseIsa        = ibex_pkg::BaseIsaRV32IorCHERIoT,
+  parameter bit TIDE_EN                      = 1'b0,
+  // QLOAD readout queue index range (frozen Version A default 16;
+  // the frozen tide_cd_top surface passes it through)
+  parameter int NRQ                          = 16
 ) (
   input  ibex_pkg::ibex_mubi_t cheriot_enable_i,
 
@@ -107,10 +111,17 @@ module ibex_decoder import ibex_cheriot_pkg::*; #(
   output cheriot_adder_a_sel_e   cheriot_adder_a_sel_o,
   output cheriot_adder_b_sel_e   cheriot_adder_b_sel_o,
   output cheriot_setaddr_sel_e   cheriot_setaddr_sel_o,
-  output cheriot_setbounds_sel_e cheriot_setbounds_sel_o
+  output cheriot_setbounds_sel_e cheriot_setbounds_sel_o,
+
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN; TideOpNone when TIDE_EN=0)
+  output ibex_tide_pkg::tide_op_e tide_op_o,     // decoded TIDE operation
+  output logic [4:0]              tide_pi_o,     // QTRIG PI (funct7[4:0])
+  output logic [11:0]             tide_imm12_o,  // QWAIT/QSYNC I-type immediate
+  output logic [4:0]              tide_rq_idx_o  // QLOAD readout queue index
 );
 
   import ibex_pkg::*;
+  import ibex_tide_pkg::*;
 
   localparam bit CheriLimit16Regs = (BaseIsa == BaseIsaRV32IorCHERIoT);
 
@@ -256,6 +267,11 @@ module ibex_decoder import ibex_cheriot_pkg::*; #(
     dret_insn_o             = 1'b0;
     ecall_insn_o            = 1'b0;
     wfi_insn_o              = 1'b0;
+
+    tide_op_o               = TideOpNone;
+    tide_pi_o               = 5'b0;
+    tide_imm12_o            = 12'b0;
+    tide_rq_idx_o           = 5'b0;
 
     cheriot_operator_o      = '0;
     instr_is_cheriot_o      = 1'b0;
@@ -828,6 +844,59 @@ module ibex_decoder import ibex_cheriot_pkg::*; #(
           cheriot_setaddr_sel_o       = SETADDR_RFA_ARITH;
         end else begin
           illegal_insn = 1'b1;
+        end
+      end
+
+      ////////////////
+      // TIDE-ISA //
+      ////////////////
+      // TIDE-ISA v0.10-rc4 section 3/4. Runtime operand checks (mask, gid,
+      // anchored, TLR overflow) are performed in the ID stage where register
+      // file data is available; the decoder only validates the encoding.
+      OPCODE_TIDE0: begin
+        if (!TIDE_EN) begin
+          illegal_insn = 1'b1;
+        end else begin
+          unique case (instr[14:12])
+            3'b000: begin // QWAIT
+              rf_ren_a_o         = 1'b1;
+              tide_op_o          = TideOpQwait;
+              tide_imm12_o       = instr[31:20];
+              illegal_insn       = (instr_rd != 5'd0);
+            end
+            3'b011: begin // QSYNC
+              rf_ren_a_o         = 1'b1;
+              tide_op_o          = TideOpQsync;
+              tide_imm12_o       = instr[31:20];
+              illegal_insn       = (instr_rd != 5'd0);
+            end
+            default: illegal_insn = 1'b1;
+          endcase
+        end
+      end
+
+      OPCODE_TIDE1: begin
+        if (!TIDE_EN) begin
+          illegal_insn = 1'b1;
+        end else begin
+          unique case (instr[14:12])
+            3'b000: begin // QTRIG
+              rf_ren_a_o         = 1'b1;
+              rf_ren_b_o         = 1'b1;
+              tide_op_o          = TideOpQtrig;
+              tide_pi_o          = instr[29:25];
+              illegal_insn       = (instr[31:30] != 2'b0) | (instr_rd != 5'd0);
+            end
+            3'b001: begin // QLOAD
+              rf_we              = 1'b1;
+              rf_wdata_sel_o     = RF_WD_CSR;
+              tide_op_o          = TideOpQload;
+              tide_rq_idx_o      = instr[19:15];
+              illegal_insn       = (instr[31:25] != 7'b0) | (instr[24:20] != 5'b0) |
+                                   ({27'b0, instr[19:15]} >= NRQ);
+            end
+            default: illegal_insn = 1'b1;
+          endcase
         end
       end
 

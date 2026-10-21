@@ -53,7 +53,15 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   // mvendorid: encoding of manufacturer/provider
   parameter logic [31:0]            CsrMvendorId                = 32'b0,
   // marchid: encoding of base microarchitecture
-  parameter logic [31:0]            CsrMimpId                   = 32'b0
+  parameter logic [31:0]            CsrMimpId                   = 32'b0,
+  // TIDE-ISA: the shadow core executes TIDE instructions with the same
+  // configuration as the main core. The CD<->DD response inputs are fed to
+  // the shadow core through the same LockstepOffset input-delay chain as all
+  // other stimulus inputs, so its TIDE stall/release behavior tracks the
+  // main core. The shadow core's TIDE request outputs are sunk (they are a
+  // deterministic function of the compared core state, so no separate
+  // comparison is required).
+  parameter bit                     TIDE_EN                   = 1'b0
 ) (
   input  logic                         clk_i,
   input  logic                         rst_ni,
@@ -120,6 +128,15 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   input  ibex_mubi_t                   core_busy_i,
   input  logic                         test_en_i,
   input  logic                         scan_rst_ni,
+  // TIDE-ISA DD response inputs (delayed by LockstepOffset for the shadow core)
+  input  ibex_tide_pkg::tide_enq_rsp_t   tide_enq_rsp_i,
+  input  ibex_tide_pkg::tide_rq_rsp_t    tide_rq_rsp_i,
+  input  logic                           tide_sync_anchor_i,
+  input  logic                           tide_gc_realign_i,
+  input  ibex_tide_pkg::tide_trap_t      tide_trap_i,
+  input  logic                           tide_halt_i,
+  input  ibex_tide_pkg::tide_csr_rsp_t   tide_csr_rsp_i,
+  input  ibex_tide_pkg::tide_mmio_rsp_t  tide_mmio_rsp_i,
 
   output ibex_mubi_t                   lockstep_cmp_en_o,
   output logic                         data_req_shadow_o,
@@ -264,6 +281,15 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     ibex_mubi_t                  cheriot_enable;
     cap_t                        rf_rcap_a;
     cap_t                        rf_rcap_b;
+    // TIDE-ISA DD response inputs (see module header)
+    ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp;
+    ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp;
+    logic                          tide_sync_anchor;
+    logic                          tide_gc_realign;
+    ibex_tide_pkg::tide_trap_t     tide_trap;
+    logic                          tide_halt;
+    ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp;
+    ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp;
   } delayed_inputs_t;
 
   delayed_inputs_t [LockstepOffset-1:0] shadow_inputs_q;
@@ -349,6 +375,14 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   assign shadow_inputs_in.cheriot_enable      = cheriot_enable_i;
   assign shadow_inputs_in.rf_rcap_a           = rf_rcap_a_i;
   assign shadow_inputs_in.rf_rcap_b           = rf_rcap_b_i;
+  assign shadow_inputs_in.tide_enq_rsp      = tide_enq_rsp_i;
+  assign shadow_inputs_in.tide_rq_rsp       = tide_rq_rsp_i;
+  assign shadow_inputs_in.tide_sync_anchor  = tide_sync_anchor_i;
+  assign shadow_inputs_in.tide_gc_realign   = tide_gc_realign_i;
+  assign shadow_inputs_in.tide_trap         = tide_trap_i;
+  assign shadow_inputs_in.tide_halt         = tide_halt_i;
+  assign shadow_inputs_in.tide_csr_rsp      = tide_csr_rsp_i;
+  assign shadow_inputs_in.tide_mmio_rsp     = tide_mmio_rsp_i;
 
   ///////////////////
   // Output delays //
@@ -444,6 +478,16 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   logic [6:0] shadow_rf_rcap_a_ecc;
   logic [6:0] shadow_rf_rcap_b_ecc;
 
+  // TIDE-ISA: shadow-core DD channel request outputs (sunk; see header).
+  ibex_tide_pkg::tide_enq_req_t  tide_enq_req_sh;
+  ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_sh;
+  ibex_tide_pkg::tide_sync_req_t tide_sync_req_sh;
+  ibex_tide_pkg::tide_csr_req_t  tide_csr_req_sh;
+  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_sh;
+  wire                           unused_tide_sh;
+  assign unused_tide_sh = |{tide_enq_req_sh, tide_rq_pop_sh, tide_sync_req_sh,
+                             tide_csr_req_sh, tide_mmio_req_sh};
+
   ibex_core #(
     .PMPEnable            ( PMPEnable            ),
     .PMPGranularity       ( PMPGranularity       ),
@@ -484,7 +528,8 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .DmExceptionAddr      ( DmExceptionAddr      ),
     .CsrMvendorId         ( CsrMvendorId         ),
     .CsrMimpId            ( CsrMimpId            ),
-    .BaseIsa              ( BaseIsa              )
+    .BaseIsa              ( BaseIsa              ),
+    .TIDE_EN              ( TIDE_EN              )
   ) u_shadow_core (
     .clk_i               (clk_i),
     .rst_ni              (rst_shadow_n),
@@ -605,7 +650,22 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .alert_minor_o          (shadow_alert_minor),
     .alert_major_internal_o (shadow_alert_major_internal),
     .alert_major_bus_o      (shadow_alert_major_bus),
-    .core_busy_o            (shadow_outputs_d.core_busy)
+    .core_busy_o            (shadow_outputs_d.core_busy),
+
+    // TIDE-ISA: shadow-core DD channels (tied to idle; see header).
+    .tide_enq_req_o         (tide_enq_req_sh),
+    .tide_enq_rsp_i         (shadow_inputs_q[0].tide_enq_rsp),
+    .tide_rq_pop_o          (tide_rq_pop_sh),
+    .tide_rq_rsp_i          (shadow_inputs_q[0].tide_rq_rsp),
+    .tide_sync_req_o        (tide_sync_req_sh),
+    .tide_sync_anchor_i     (shadow_inputs_q[0].tide_sync_anchor),
+    .tide_gc_realign_i      (shadow_inputs_q[0].tide_gc_realign),
+    .tide_trap_i            (shadow_inputs_q[0].tide_trap),
+    .tide_halt_i            (shadow_inputs_q[0].tide_halt),
+    .tide_csr_req_o         (tide_csr_req_sh),
+    .tide_csr_rsp_i         (shadow_inputs_q[0].tide_csr_rsp),
+    .tide_mmio_req_o        (tide_mmio_req_sh),
+    .tide_mmio_rsp_i        (shadow_inputs_q[0].tide_mmio_rsp)
   );
 
   // Extract cap data from shadow core's unified cap ECC output (cap in lower REGCAP_W bits)

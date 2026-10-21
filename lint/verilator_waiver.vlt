@@ -77,3 +77,53 @@ lint_off -file "*/lowrisc_prim_*/rtl/*.sv"
 
 lint_off -rule UNUSED -file "*/rtl/ibex_top_tracing.sv" -match "*RndCnstLfsrSeed*"
 lint_off -rule UNUSED -file "*/rtl/ibex_top_tracing.sv" -match "*RndCnstLfsrPerm*"
+
+// TIDE-ISA: ibex_tide_pkg declares the frozen Version-A defaults of the TIDE
+// build parameters (TIDE_EN, NCH, NRQ, TQ_DEPTH, RQ_DEPTH, TQ_GUARD,
+// NSYNC_SET; see ibex_tide_pkg.sv section 'Parameter freeze (Version A)').
+// The modules below re-declare the same names as module parameters: that is
+// the frozen per-instance parameter surface (tide_doc ch09) which the DV
+// flow overrides with -pvalue. The module-scope declaration intentionally
+// shadows the package-level default; per SV-2017 name resolution the module
+// parameter always wins, so there is no functional impact.
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'TIDE_EN'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'NCH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'NRQ'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'TQ_DEPTH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'RQ_DEPTH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'TQ_GUARD'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_core.sv" -match "*'NSYNC_SET'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'TIDE_EN'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'NCH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'NRQ'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'TQ_DEPTH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'RQ_DEPTH'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'TQ_GUARD'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_cs_registers.sv" -match "*'NSYNC_SET'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_controller.sv" -match "*'TIDE_EN'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_top.sv" -match "*'TIDE_EN'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_top_tracing.sv" -match "*'TIDE_EN'*"
+lint_off -rule VARHIDDEN -file "*/rtl/ibex_lockstep.sv" -match "*'TIDE_EN'*"
+
+// TIDE-ISA: protocol-redundant fields of the frozen adapter types that the
+// CD datapath does not consume (frozen types: ibex_tide_pkg.sv, from
+// tide_doc ch09 section 3 / ch10 section 3.3). The DD side still drives
+// them; validity is guaranteed by the always-ready same-cycle protocol
+// (rsp.valid == req.valid) and by the dedicated control flags below, and
+// is checked by SVA in the DV environment rather than by the CD datapath.
+//  - tide_mmio_rsp_t.valid / tide_csr_rsp_t.valid: redundant with the
+//    request itself (always-ready, rsp in the same cycle as req).
+//  - tide_csr_rsp_t.illegal: DD-side protocol completeness; the CD-side
+//    reaction to it is not defined by the ISA, so the CD ignores it.
+//  - tide_trap_ctx_t.valid: the trap-save latch condition uses the source
+//    valid; the latched context copy's own valid is bookkeeping only.
+//  - tide_trap_t.valid / is_failstop / trap_class (controller copies):
+//    the controller gates on the combinational tide_trap_i valid and
+//    is_failstop inputs (tide_kill_req_d / tide_async_pulse_d) and keeps
+//    dedicated flags (tide_trap_pend_q / tide_async_valid_q) for the
+//    registered path; the struct copies of these fields are not read.
+lint_off -rule UNUSED -file "*/rtl/ibex_core.sv" -match "*'tide_mmio_rsp_i'*"
+lint_off -rule UNUSED -file "*/rtl/ibex_cs_registers.sv" -match "*'tide_csr_rsp_i'*"
+lint_off -rule UNUSED -file "*/rtl/ibex_cs_registers.sv" -match "*'tide_trap_snap_q'*"
+lint_off -rule UNUSED -file "*/rtl/ibex_controller.sv" -match "*'tide_trap_q'*"
+lint_off -rule UNUSED -file "*/rtl/ibex_controller.sv" -match "*'tide_async_q'*"

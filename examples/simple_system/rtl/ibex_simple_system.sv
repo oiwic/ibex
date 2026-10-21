@@ -55,6 +55,12 @@ module ibex_simple_system (
   parameter int unsigned        PMPNumRegions            = 4;
   parameter int unsigned        MHPMCounterNum           = 0;
   parameter int unsigned        MHPMCounterWidth         = 40;
+  // TIDE-ISA: this system provides no DD side. TIDE is disabled by
+  // default (upstream-identical behavior); the channel pins are tied
+  // to idle (reset) values below. Named TIDE_EN_SYS (not TIDE_EN) so
+  // tool-level -G parameter overrides cannot collide with the
+  // same-named ibex_tide_pkg::TIDE_EN package parameter.
+  parameter bit                 TIDE_EN_SYS                = 1'b0;
   parameter bit                 RV32E                    = 1'b0;
   parameter ibex_pkg::rv32m_e   RV32M                    = `RV32M;
   parameter ibex_pkg::rv32b_e   RV32B                    = `RV32B;
@@ -205,6 +211,17 @@ module ibex_simple_system (
     assign instr_rdata_intg = '0;
   end
 
+  // TIDE-ISA channel outputs of the core: no DD exists in this system,
+  // so the request outputs are sunk (see unused_tide below).
+  ibex_tide_pkg::tide_enq_req_t  tide_enq_req_w;
+  ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_w;
+  ibex_tide_pkg::tide_sync_req_t tide_sync_req_w;
+  ibex_tide_pkg::tide_csr_req_t  tide_csr_req_w;
+  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_w;
+  wire                           unused_tide;
+  assign unused_tide = |{tide_enq_req_w, tide_rq_pop_w, tide_sync_req_w,
+                          tide_csr_req_w, tide_mmio_req_w};
+
   ibex_top_tracing #(
       .BaseIsa              ( BaseIsa              ),
       .SecureIbex           ( SecureIbex           ),
@@ -230,7 +247,8 @@ module ibex_simple_system (
       .DmBaseAddr           ( 32'h00100000         ),
       .DmAddrMask           ( 32'h00000003         ),
       .DmHaltAddr           ( 32'h00100000         ),
-      .DmExceptionAddr      ( 32'h00100000         )
+      .DmExceptionAddr      ( 32'h00100000         ),
+      .TIDE_EN              ( TIDE_EN_SYS          )
     ) u_top (
       .clk_i                     (clk_sys),
       .rst_ni                    (rst_sys_n),
@@ -312,7 +330,24 @@ module ibex_simple_system (
       .instr_req_shadow_o        (),
       .instr_addr_shadow_o       (),
 
-      .cheriot_enable_i          (ibex_pkg::IbexMuBiOff)
+      .cheriot_enable_i          (ibex_pkg::IbexMuBiOff),
+
+      // TIDE-ISA: no DD side in this system (see header comment).
+      // TIDE_EN=0: DUT TIDE logic elided, pins idle.
+      // TIDE_EN=1: pins held at idle values (lint configuration).
+      .tide_enq_req_o          (tide_enq_req_w),
+      .tide_enq_rsp_i          ('0),
+      .tide_rq_pop_o           (tide_rq_pop_w),
+      .tide_rq_rsp_i           ('0),
+      .tide_sync_req_o         (tide_sync_req_w),
+      .tide_sync_anchor_i      (1'b0),
+      .tide_gc_realign_i       (1'b0),
+      .tide_trap_i             ('0),
+      .tide_halt_i             (1'b0),
+      .tide_csr_req_o          (tide_csr_req_w),
+      .tide_csr_rsp_i          ('0),
+      .tide_mmio_req_o         (tide_mmio_req_w),
+      .tide_mmio_rsp_i         ('0)
     );
 
   // SRAM block for instruction and data storage

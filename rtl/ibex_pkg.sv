@@ -81,7 +81,10 @@ package ibex_pkg;
     OPCODE_JAL      = 7'h6f,
     OPCODE_SYSTEM   = 7'h73,
     OPCODE_CHERI    = 7'h5b,
-    OPCODE_AUICGP   = 7'h7b
+    OPCODE_AUICGP   = 7'h7b,
+    // TIDE-ISA v0.10-rc4 section 3.1 (custom-0 / custom-1)
+    OPCODE_TIDE0    = 7'h0b,
+    OPCODE_TIDE1    = 7'h2b
   } opcode_e;
 
 
@@ -270,7 +273,9 @@ package ibex_pkg;
     FLUSH,
     IRQ_TAKEN,
     DBG_TAKEN_IF,
-    DBG_TAKEN_ID
+    DBG_TAKEN_ID,
+    // TIDE-ISA: interrupt entry while a TIDE instruction is blocked in ID (mepc = its PC)
+    IRQ_TAKEN_ID
   } ctrl_fsm_e;
 
   //////////////
@@ -349,6 +354,10 @@ package ibex_pkg;
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd11};
   localparam exc_cause_t ExcCauseCheriFault =
     '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd28};
+
+  // TIDE-ISA: all TQ_* traps share mcause=24 (ISA section 5.4 / 6.6).
+  localparam exc_cause_t ExcCauseTide =
+    '{irq_ext: 1'b0, irq_int: 1'b0, lower_cause: 5'd24};
 
   // Internal NMI cause
   typedef enum logic [4:0] {
@@ -662,7 +671,33 @@ package ibex_pkg;
     CSR_HPMCOUNTER30H  = 12'hC9E,
     CSR_HPMCOUNTER31H  = 12'hC9F,
     CSR_CPUCTRLSTS     = 12'h7C0,
-    CSR_SECURESEED     = 12'h7C1
+    CSR_SECURESEED     = 12'h7C1,
+    // TIDE-ISA v0.10-rc4 section 5.1/5.2 custom CSR space.
+    // 0x7C0/0x7C1 are ISA-owned (tqcfg/tqrty); the two Ibex secure CSRs above
+    // yield to them in TIDE builds (open item O1). TIDE_EN=0 keeps upstream
+    // behaviour for all six existing configurations.
+    CSR_TQSYT        = 12'h7C2,
+    CSR_TQHALT_REQ   = 12'h7C3,
+    CSR_TQERR_POLICY = 12'h7C4,
+    CSR_TQIDX        = 12'h7C5,
+    CSR_TQSINK       = 12'h7C6,
+    CSR_TQFLUSH      = 12'h7C7,
+    CSR_TQGC         = 12'hFC0,
+    CSR_TQGCH        = 12'hFC1,
+    CSR_TQTLR        = 12'hFC2,
+    CSR_TQTLRH       = 12'hFC3,
+    CSR_TQSTATE      = 12'hFC4,
+    CSR_TQFDOM       = 12'hFC5,
+    CSR_TQRDATA      = 12'hFC6,
+    CSR_TQRES        = 12'hFC7,
+    CSR_TQSCHEMA     = 12'hFC8,
+    CSR_TQHEAD       = 12'hFC9,
+    CSR_TQHEADH      = 12'hFCA,
+    // 0xFCB reserved (former tqsusp removed; access is illegal)
+    CSR_TQSYNCCAP    = 12'hFCC,
+    CSR_TQCAUSE      = 12'hFCD,
+    CSR_TQFAULT      = 12'hFCE,
+    CSR_TQFAULTH     = 12'hFCF
   } csr_num_e;
 
   // CSR pmp-related offsets

@@ -14,7 +14,7 @@
 /**
  * Top level module of the ibex RISC-V core
  */
-module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
+module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide_pkg::*; #(
   parameter base_isa_e              BaseIsa                     = BaseIsaRV32I,
   parameter bit                     PMPEnable                   = 1'b0,
   parameter int unsigned            PMPGranularity              = 0,
@@ -56,7 +56,18 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   // mvendorid: encoding of manufacturer/provider
   parameter logic [31:0]            CsrMvendorId                = 32'b0,
   // marchid: encoding of base microarchitecture
-  parameter logic [31:0]            CsrMimpId                   = 32'b0
+  parameter logic [31:0]            CsrMimpId                   = 32'b0,
+
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN; ch10 section 3.3). Version A
+  // defaults match ibex_tide_pkg; the frozen tide_cd_top surface passes
+  // them through.
+  parameter bit                     TIDE_EN                     = 1'b0,
+  parameter int                     NCH                         = 16,
+  parameter int                     NRQ                         = 16,
+  parameter int                     TQ_DEPTH                    = 32,
+  parameter int                     RQ_DEPTH                    = 4,
+  parameter int                     TQ_GUARD                    = 8,
+  parameter int                     NSYNC_SET                   = 16
 ) (
   // Clock and Reset
   input  logic                         clk_i,
@@ -86,6 +97,23 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   input  logic [MemDataWidth-1:0]      data_rdata_i,
   input  logic                         data_tag_i,
   input  logic                         data_err_i,
+
+  // TIDE-ISA v0.10-rc4 CD<->DD boundary (ch09 section 3; ch10 section 3.3).
+  // The core is a transparent carrier: the CD TIDE logic lives in the ID
+  // stage; only the MMIO configuration window is decoded here (section 4.2).
+  output ibex_tide_pkg::tide_enq_req_t  tide_enq_req_o,
+  input  ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp_i,
+  output ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_o,
+  input  ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp_i,
+  output ibex_tide_pkg::tide_sync_req_t tide_sync_req_o,
+  input  logic                          tide_sync_anchor_i,
+  input  logic                          tide_gc_realign_i,
+  input  ibex_tide_pkg::tide_trap_t     tide_trap_i,
+  input  logic                          tide_halt_i,
+  output ibex_tide_pkg::tide_csr_req_t  tide_csr_req_o,
+  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i,
+  output ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_o,
+  input  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_i,
 
   // Register file interface
   output logic                         dummy_instr_id_o,
@@ -381,6 +409,27 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   logic                   pmp_req_err  [PMPNumChan];
   logic                   data_req_out;
 
+  // TIDE-ISA interconnect (ID stage -> CSR file / core boundary)
+  logic [47:0]                tide_tlr_int;
+  ibex_tide_pkg::tide_trap_ctx_t tide_trap_ctx_int;
+  logic [31:0]              tide_tqrty_int;
+  logic [31:0]              tide_tqsyt_int;
+
+  // TIDE-ISA MMIO configuration window bridge (ch10 section 4.2):
+  // 0x4001_xxxx is served by the DD configuration plane. The DD responds
+  // combinationally in the request cycle (frozen adapter protocol); the
+  // bridge registers the response so the LSU sees a standard 1-cycle
+  // access (gnt on the request cycle, rvalid the next).
+  localparam logic [15:0] TIDE_MMIO_WINDOW = 16'h4001;
+  logic        mmio_win_req;
+  logic        mmio_win_rvalid_q;
+  logic        mmio_win_err_q;
+  logic [31:0] mmio_win_rdata_q;
+  logic        data_gnt_int;
+  logic        data_rvalid_int;
+  logic        data_err_int;
+  logic [MemDataWidth-1:0] data_rdata_int;
+
   logic        csr_save_if;
   logic        csr_save_id;
   logic        csr_save_wb;
@@ -669,7 +718,10 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .WritebackStage (WritebackStage),
     .BranchPredictor(BranchPredictor),
     .MemECC         (MemECC),
-    .BaseIsa        (BaseIsa)
+  .BaseIsa        (BaseIsa),
+  .TIDE_EN        (TIDE_EN),
+  .NCH            (NCH),
+  .NRQ            (NRQ)
   ) id_stage_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -854,7 +906,28 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .cheriot_wb_err_i        (cheriot_wb_err),
     .cheriot_wb_err_info_i   (cheriot_wb_err_info),
     .cheriot_branch_req_i    (cheriot_branch_req_spec),
-    .cheriot_branch_target_i (branch_target_ex_cheriot)
+  .cheriot_branch_target_i (branch_target_ex_cheriot),
+
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN)
+  .tide_enq_rsp_i    (tide_enq_rsp_i),
+  .tide_rq_rsp_i     (tide_rq_rsp_i),
+  .tide_sync_anchor_i(tide_sync_anchor_i),
+  .tide_gc_realign_i (tide_gc_realign_i),
+  .tide_halt_i       (tide_halt_i),
+  .tide_trap_i       (tide_trap_i),
+  .tide_tqrty_i      (tide_tqrty_int),
+  .tide_tqsyt_i      (tide_tqsyt_int),
+
+  .tide_enq_req_o    (tide_enq_req_o),
+  .tide_rq_pop_o     (tide_rq_pop_o),
+  .tide_sync_req_o   (tide_sync_req_o),
+  .tide_tlr_o        (tide_tlr_int),
+  .tide_trap_ctx_o   (tide_trap_ctx_int),
+  // consumed inside the ID stage (controller) / not exposed further
+  .tide_anchored_o   (),
+  .tide_block_o      (),
+  .tide_id_trap_o    (),
+  .tide_irq_ready_o  ()
   );
 
   // for RVFI only
@@ -1057,7 +1130,41 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   /////////////////////
 
 
-  assign data_req_o   = data_req_out & ~pmp_req_err[PMP_D];
+  // TIDE-ISA MMIO configuration window bridge (ch10 section 4.2). The
+  // windowed access is answered by the DD; it never reaches the external
+  // data bus. gnt is driven on the request cycle, the registered rvalid/
+  // rdata (or the store ack) one cycle later - a standard 1-cycle access
+  // as far as the LSU is concerned.
+  assign mmio_win_req = TIDE_EN & data_req_out & ~pmp_req_err[PMP_D] &
+                        (data_addr_o[31:16] == TIDE_MMIO_WINDOW);
+
+  assign tide_mmio_req_o.valid  = mmio_win_req;
+  assign tide_mmio_req_o.write  = data_we_o;
+  assign tide_mmio_req_o.addr   = data_addr_o[15:0];
+  assign tide_mmio_req_o.be     = data_be_o;
+  assign tide_mmio_req_o.wdata  = data_wdata_o;
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin : tide_mmio_rsp_reg
+    if (!rst_ni) begin
+      mmio_win_rvalid_q <= 1'b0;
+      mmio_win_err_q    <= 1'b0;
+      mmio_win_rdata_q  <= 32'd0;
+    end else begin
+      mmio_win_rvalid_q <= mmio_win_req;
+      if (mmio_win_req) begin
+        mmio_win_err_q   <= tide_mmio_rsp_i.err;
+        mmio_win_rdata_q <= tide_mmio_rsp_i.rdata;
+      end
+    end
+  end
+
+  assign data_gnt_int    = data_gnt_i | mmio_win_req;
+  assign data_rvalid_int = data_rvalid_i | mmio_win_rvalid_q;
+  assign data_err_int    = data_err_i | (mmio_win_rvalid_q & mmio_win_err_q);
+  assign data_rdata_int  = mmio_win_rvalid_q ?
+                           {{(MemDataWidth-32){1'b0}}, mmio_win_rdata_q} : data_rdata_i;
+
+  assign data_req_o      = data_req_out & ~pmp_req_err[PMP_D] & ~mmio_win_req;
   assign lsu_resp_err = lsu_load_err | lsu_store_err;
 
   ibex_load_store_unit #(
@@ -1071,9 +1178,9 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .cheriot_enable_i (cheriot_enable_i),
     // data interface
     .data_req_o    (data_req_out),
-    .data_gnt_i    (data_gnt_i),
-    .data_rvalid_i (data_rvalid_i),
-    .data_bus_err_i(data_err_i),
+  .data_gnt_i    (data_gnt_int),
+  .data_rvalid_i (data_rvalid_int),
+  .data_bus_err_i(data_err_int),
     .data_pmp_err_i(pmp_req_err[PMP_D]),
 
     .data_addr_o      (data_addr_o),
@@ -1081,7 +1188,7 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .data_be_o        (data_be_o),
     .data_wdata_o     (data_wdata_o),
     .data_tag_o       (data_tag_o),
-    .data_rdata_i     (data_rdata_i),
+  .data_rdata_i     (data_rdata_int),
     .data_tag_i       (data_tag_i),
 
     // signals to/from ID/EX stage
@@ -1455,7 +1562,14 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .RV32B            (RV32B),
     .CsrMvendorId     (CsrMvendorId),
     .CsrMimpId        (CsrMimpId),
-    .BaseIsa          (BaseIsa)
+  .BaseIsa          (BaseIsa),
+  .TIDE_EN          (TIDE_EN),
+  .NCH              (NCH),
+  .NRQ              (NRQ),
+  .TQ_DEPTH         (TQ_DEPTH),
+  .RQ_DEPTH         (RQ_DEPTH),
+  .TQ_GUARD         (TQ_GUARD),
+  .NSYNC_SET        (NSYNC_SET)
   ) cs_registers_i (
     .clk_i (clk_i),
     .rst_ni(rst_ni),
@@ -1572,7 +1686,15 @@ module ibex_core import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .pcc_cap_i                (pcc_cap_w),
     .pcc_cap_o                (pcc_cap_r),
     .csr_dbg_tclr_fault_o     (csr_dbg_tclr_fault),
-    .cheriot_fatal_err_o      (cheriot_fatal_err)
+  .cheriot_fatal_err_o      (cheriot_fatal_err),
+
+  // TIDE-ISA v0.10-rc4 CSR surface (gated by TIDE_EN)
+  .tide_tlr_i        (tide_tlr_int),
+  .tide_trap_ctx_i   (tide_trap_ctx_int),
+  .tide_tqrty_o      (tide_tqrty_int),
+  .tide_tqsyt_o      (tide_tqsyt_int),
+  .tide_csr_req_o    (tide_csr_req_o),
+  .tide_csr_rsp_i    (tide_csr_rsp_i)
   );
 
   // These assertions are in top-level as instr_valid_id required as the enable term

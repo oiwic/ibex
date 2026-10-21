@@ -77,6 +77,11 @@ module core_ibex_tb_top;
   parameter int unsigned LockstepOffset   = 1;
   parameter bit ICacheScramble            = 1'b0;
   parameter bit DbgTriggerEn              = 1'b0;
+`ifdef TIDE_REAL_DD
+  parameter bit TIDE_EN                   = 1'b1;
+`else
+  parameter bit TIDE_EN                   = 1'b0;
+`endif
   parameter int unsigned DmBaseAddr       = 32'h`DM_ADDR;
   parameter int unsigned DmAddrMask       = 32'h`DM_ADDR_MASK;
   parameter int unsigned DmHaltAddr       = 32'h`DEBUG_MODE_HALT_ADDR;
@@ -99,6 +104,23 @@ module core_ibex_tb_top;
   // key and nonce are driven by push_pull Device interface
   assign {scramble_key, scramble_nonce} = scrambling_key_if.d_data;
 
+  // TIDE-ISA v0.10-rc4 CD<->DD boundary (ch09 section 3; ch10 section 3.4).
+  // Phase 1: with TIDE_EN=1 the DD side is tide_dd_stub (a test double, not
+  // Phase 2 evidence). With TIDE_EN=0 the wires carry the pre-TIDE constants
+  // so the build stays bit-identical to the TIDE_EN=0 baseline.
+  ibex_tide_pkg::tide_enq_req_t  tide_enq_req_w;
+  ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp_w;
+  ibex_tide_pkg::tide_rq_req_t   tide_rq_req_w;
+  ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp_w;
+  ibex_tide_pkg::tide_sync_req_t tide_sync_req_w;
+  logic                          tide_sync_anchor_w;
+  logic                          tide_gc_realign_w;
+  ibex_tide_pkg::tide_trap_t     tide_trap_w;
+  logic                          tide_halt_w;
+  ibex_tide_pkg::tide_csr_req_t  tide_csr_req_w;
+  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_w;
+  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_w;
+  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_w;
   ibex_top_tracing #(
     .BaseIsa              (BaseIsa             ),
     .PMPEnable            (PMPEnable           ),
@@ -120,6 +142,7 @@ module core_ibex_tb_top;
     .ICacheScramble       (ICacheScramble      ),
     .BranchPredictor      (BranchPredictor     ),
     .DbgTriggerEn         (DbgTriggerEn        ),
+    .TIDE_EN              (TIDE_EN             ),
     .DmBaseAddr           (DmBaseAddr          ),
     .DmAddrMask           (DmAddrMask          ),
     .DmHaltAddr           (DmHaltAddr          ),
@@ -203,8 +226,153 @@ module core_ibex_tb_top;
     .data_wdata_intg_shadow_o  (                           ),
 
     .instr_req_shadow_o        (                           ),
-    .instr_addr_shadow_o       (                           )
+    .instr_addr_shadow_o       (                           ),
+    // TIDE-ISA v0.10-rc4 CD<->DD boundary (ch09 section 3; ch10 section 3.4).
+    // Phase 1: with TIDE_EN=1 the frozen boundary is driven by tide_dd_stub
+    // (gen_tide_dd below); with TIDE_EN=0 the inputs hold the pre-TIDE
+    // constants and the core requests are sunk (gen_tide_dd_off).
+    .tide_enq_req_o            (tide_enq_req_w           ),
+    .tide_enq_rsp_i            (tide_enq_rsp_w           ),
+    .tide_rq_pop_o             (tide_rq_req_w            ),
+    .tide_rq_rsp_i             (tide_rq_rsp_w            ),
+    .tide_sync_req_o           (tide_sync_req_w          ),
+    .tide_sync_anchor_i        (tide_sync_anchor_w       ),
+    .tide_gc_realign_i         (tide_gc_realign_w        ),
+    .tide_trap_i               (tide_trap_w              ),
+    .tide_halt_i               (tide_halt_w              ),
+    .tide_csr_req_o            (tide_csr_req_w           ),
+    .tide_csr_rsp_i            (tide_csr_rsp_w           ),
+    .tide_mmio_req_o           (tide_mmio_req_w          ),
+    .tide_mmio_rsp_i           (tide_mmio_rsp_w          )
   );
+
+  // TIDE-ISA v0.10-rc4 DD side (Phase 1 test double; ch10 section 3.4). The
+  // stub models only the frozen boundary behaviour and is not Phase 2
+  // compliance evidence (top-level AGENTS.md section 6, rule 9).
+  generate
+    if (TIDE_EN) begin : gen_tide_dd
+`ifdef TIDE_REAL_DD
+      logic [15:0] dd_commit_valid;
+      logic [15:0][47:0] dd_commit_ts;
+      logic [15:0][31:0] dd_commit_code;
+      logic [15:0] dd_completion_valid;
+      logic [15:0][31:0] dd_completion_result;
+      logic [15:0][47:0] dd_completion_tdone;
+      tide_dd_pkg::tide_tqcause_e dd_trap_cause;
+      tide_dd_pkg::tide_trap_class_e dd_trap_class;
+      logic [1:0] dd_init_realign_q;
+
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) dd_init_realign_q <= 2'b00;
+        else if (!(&dd_init_realign_q)) dd_init_realign_q <= dd_init_realign_q + 1'b1;
+      end
+      assign tide_gc_realign_w = ~(&dd_init_realign_q);
+
+      tide_dd_top #(
+        .NHART(1), .NCH(16), .NRQ(16), .TQ_DEPTH(32),
+        .RQ_DEPTH(4), .TQ_GUARD(8), .NSYNC_SET(16), .XBOARD_K(2)
+      ) u_tide_dd_top (
+        .clk_i(clk), .rst_ni(rst_n), .realign_i(tide_gc_realign_w),
+        .enq_valid_i(tide_enq_req_w.valid),
+        .enq_mask_i(tide_enq_req_w.mask),
+        .enq_code_i(tide_enq_req_w.code),
+        .enq_pi_i(tide_enq_req_w.pi),
+        .enq_ts_i(tide_enq_req_w.ts_prime),
+        .enq_pc_i(tide_enq_req_w.pc),
+        .enq_stall_o(tide_enq_rsp_w.stall),
+        .enq_illegal_o(tide_enq_rsp_w.illegal),
+        .enq_tq_err_o(tide_enq_rsp_w.tq_err),
+        .enq_tqcause_o(tide_enq_rsp_w.tqcause),
+        .enq_ch_o(tide_enq_rsp_w.ch),
+        .rq_pop_valid_i(tide_rq_req_w.valid),
+        .rq_idx_i(tide_rq_req_w.rq_idx),
+        .rq_valid_o(tide_rq_rsp_w.valid),
+        .rq_result_o(tide_rq_rsp_w.result),
+        .sync_valid_i({tide_sync_req_w.valid}),
+        .sync_gid_i({tide_sync_req_w.gid}),
+        .sync_anchor_o(tide_sync_anchor_w),
+        .trap_valid_o(tide_trap_w.valid),
+        .trap_failstop_o(tide_trap_w.is_failstop),
+        .trap_cause_o(dd_trap_cause),
+        .trap_class_o(dd_trap_class),
+        .trap_target_is_queue_o(tide_trap_w.target_is_queue),
+        .trap_target_idx_o(tide_trap_w.target_idx),
+        .trap_ts_o(tide_trap_w.ts),
+        .trap_gid_o(tide_trap_w.gid),
+        .halt_o(tide_halt_w),
+        .csr_valid_i(tide_csr_req_w.valid),
+        .csr_write_i(tide_csr_req_w.write),
+        .csr_addr_i(tide_csr_req_w.addr),
+        .csr_wdata_i(tide_csr_req_w.wdata),
+        .csr_tlr_i(tide_csr_req_w.tlr),
+        .csr_rsp_valid_o(tide_csr_rsp_w.valid),
+        .csr_rdata_o(tide_csr_rsp_w.rdata),
+        .csr_illegal_o(tide_csr_rsp_w.illegal),
+        .mmio_valid_i(tide_mmio_req_w.valid),
+        .mmio_write_i(tide_mmio_req_w.write),
+        .mmio_addr_i(tide_mmio_req_w.addr),
+        .mmio_be_i(tide_mmio_req_w.be),
+        .mmio_wdata_i(tide_mmio_req_w.wdata),
+        .mmio_rsp_valid_o(tide_mmio_rsp_w.valid),
+        .mmio_rsp_rdata_o(tide_mmio_rsp_w.rdata),
+        .mmio_rsp_err_o(tide_mmio_rsp_w.err),
+        .commit_valid_o(dd_commit_valid),
+        .commit_ts_o(dd_commit_ts),
+        .commit_code_o(dd_commit_code),
+        .completion_valid_i(dd_completion_valid),
+        .completion_result_i(dd_completion_result),
+        .completion_tdone_i(dd_completion_tdone),
+        .backend_err_valid_i(1'b0),
+        .backend_err_cause_i(tide_dd_pkg::TqCauseFbStale),
+        .backend_err_ch_i(5'd0),
+        .backend_err_ts_i(48'd0)
+      );
+
+      // Identity backend for the integration smoke test: every committed
+      // event produces its completion record in the same channel/queue.
+      assign dd_completion_valid  = dd_commit_valid;
+      assign dd_completion_result = dd_commit_code;
+      assign dd_completion_tdone  = dd_commit_ts;
+      assign tide_trap_w.tqcause = ibex_tide_pkg::tide_tqcause_e'(dd_trap_cause);
+      assign tide_trap_w.trap_class =
+          ibex_tide_pkg::tide_trap_class_e'(dd_trap_class);
+      // tide_gc_realign_w is generated above as the power-on P2 pulse.
+`else
+      tide_dd_stub u_tide_dd_stub (
+        .clk           (clk                ),
+        .rst_n         (rst_n              ),
+        .enq_req_i     (tide_enq_req_w     ),
+        .enq_rsp_o     (tide_enq_rsp_w     ),
+        .rq_req_i      (tide_rq_req_w      ),
+        .rq_rsp_o      (tide_rq_rsp_w      ),
+        .sync_req_i    (tide_sync_req_w    ),
+        .sync_anchor_o (tide_sync_anchor_w ),
+        .gc_realign_o  (tide_gc_realign_w  ),
+        .trap_o        (tide_trap_w        ),
+        .halt_o        (tide_halt_w        ),
+        .csr_req_i     (tide_csr_req_w     ),
+        .csr_rsp_o     (tide_csr_rsp_w     ),
+        .mmio_req_i    (tide_mmio_req_w    ),
+        .mmio_rsp_o    (tide_mmio_rsp_w    )
+      );
+`endif
+    end else begin : gen_tide_dd_off
+      // TIDE_EN=0: pre-TIDE constants on the DD-side inputs.
+      assign tide_enq_rsp_w     = '0;
+      assign tide_rq_rsp_w      = '0;
+      assign tide_sync_anchor_w = 1'b0;
+      assign tide_gc_realign_w  = 1'b0;
+      assign tide_trap_w        = '0;
+      assign tide_halt_w        = 1'b0;
+      assign tide_csr_rsp_w     = '0;
+      assign tide_mmio_rsp_w    = '0;
+      // TIDE_EN=0: the core's TIDE request outputs are unused.
+      logic unused_tide_reqs;
+      assign unused_tide_reqs = |{tide_enq_req_w, tide_rq_req_w,
+                                   tide_sync_req_w, tide_csr_req_w,
+                                   tide_mmio_req_w};
+    end
+  endgenerate
 
   `define IBEX_RF_PATH core_ibex_tb_top.dut.u_ibex_top.gen_regfile_ff.register_file_i
 

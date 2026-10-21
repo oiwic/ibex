@@ -11,11 +11,12 @@
 `include "prim_assert.sv"
 `include "dv_fcov_macros.svh"
 
-module ibex_controller import ibex_pkg::*; #(
+module ibex_controller import ibex_pkg::*; import ibex_tide_pkg::*; #(
   parameter base_isa_e BaseIsa  = BaseIsaRV32I,
   parameter bit WritebackStage  = 1'b0,
   parameter bit BranchPredictor = 1'b0,
-  parameter bit MemECC          = 1'b0
+  parameter bit MemECC          = 1'b0,
+  parameter bit TIDE_EN         = 1'b0
  ) (
   input  logic                  clk_i,
   input  logic                  rst_ni,
@@ -131,7 +132,15 @@ module ibex_controller import ibex_pkg::*; #(
   input  logic  [11:0]          cheriot_ex_err_info_i,
   input  logic  [15:0]          cheriot_wb_err_info_i,
   input  logic                  cheriot_branch_req_i,
-  input  logic [31:0]           cheriot_branch_target_i
+  input  logic [31:0]           cheriot_branch_target_i,
+
+  // TIDE-ISA v0.10-rc4 trap arbitration (ch09 section 6.3; gated by TIDE_EN)
+  input  logic                          tide_block_i,       // TIDE instr blocked in ID
+  input  logic                          tide_irq_ready_i,   // pipeline-empty window for IRQ/dbg
+  input  ibex_tide_pkg::tide_id_trap_t  tide_id_trap_i,     // ID-stage sync TQ_* trap
+  input  ibex_tide_pkg::tide_trap_t     tide_trap_i,        // DD error/fail-stop (1-cycle pulse)
+  input  logic                          tide_halt_i,        // fault domain halted level
+  output ibex_tide_pkg::tide_trap_ctx_t tide_trap_ctx_o     // trap context for CSR snapshot
 );
 
   ctrl_fsm_e ctrl_fsm_cs, ctrl_fsm_ns;
@@ -174,6 +183,19 @@ module ibex_controller import ibex_pkg::*; #(
   logic enter_debug_mode_prio_q;
   logic enter_debug_mode;
   logic ebreak_into_debug;
+
+  // TIDE-ISA: trap arbitration state (ch09 section 6.3)
+  logic tide_trap_prio;
+  logic tide_kill_req_d;
+  logic tide_async_pulse_d;
+  logic tide_trap_pend_q;
+  logic tide_kill_q;
+  logic tide_async_pend_q;
+  logic tide_async_valid_q;
+  logic tide_dbg_capture_q;
+  ibex_tide_pkg::tide_trap_t tide_trap_q;
+  ibex_tide_pkg::tide_trap_t tide_async_q;
+  logic unused_tide_halt_i;
   logic irq_enabled;
   logic handle_irq;
   logic id_wb_pending;
@@ -265,11 +287,26 @@ module ibex_controller import ibex_pkg::*; #(
   // the FLUSH state so the cycle following exc_req_q won't remain set for an
   // exception request that has just been handled.
   // All terms in this expression are qualified by instr_valid_i
+  // TIDE-ISA (ch09 section 6.3 / ISA section 6.5): sync TQ_* trap from the ID
+  // stage (level), fail-stop kill of a blocked TIDE instruction (reported as
+  // TQ_UNDERRUN class 2), and an async TIDE error taken at the current
+  // execution point while a TIDE instruction is blocked.
+  assign tide_kill_req_d    = TIDE_EN & tide_trap_i.valid & tide_trap_i.is_failstop &
+                             tide_block_i;
+  assign tide_async_pulse_d = TIDE_EN & tide_trap_i.valid & ~tide_trap_i.is_failstop &
+                             tide_block_i;
+
   assign exc_req_d = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err
                     | ((cheriot_enable_i == IbexMuBiOn) & cheriot_ex_err)
-                    | cheriot_asr_err_d) & (ctrl_fsm_cs != FLUSH);
+                    | cheriot_asr_err_d
+                    | (TIDE_EN & (tide_id_trap_i.valid | tide_kill_req_d |
+                                  tide_async_pulse_d)))
+                    & (ctrl_fsm_cs != FLUSH);
   assign exc_req_nc = (ecall_insn | ebrk_insn | illegal_insn_d | instr_fetch_err
-                    | cheriot_asr_err_d) & (ctrl_fsm_cs != FLUSH);
+                     | cheriot_asr_err_d
+                     | (TIDE_EN & (tide_id_trap_i.valid | tide_kill_req_d |
+                                   tide_async_pulse_d)))
+                     & (ctrl_fsm_cs != FLUSH);
 
   // LSU exception requests
   assign exc_req_lsu = store_err_i | load_err_i;
@@ -299,6 +336,7 @@ module ibex_controller import ibex_pkg::*; #(
   if (WritebackStage) begin : g_wb_exceptions
     always_comb begin
       instr_fetch_err_prio = 0;
+      tide_trap_prio         = 1'b0;
       illegal_insn_prio    = 0;
       ecall_insn_prio      = 0;
       ebrk_insn_prio       = 0;
@@ -311,7 +349,11 @@ module ibex_controller import ibex_pkg::*; #(
       // Note that with the writeback stage store/load errors occur on the instruction in writeback,
       // all other exception/faults occur on the instruction in ID/EX. The faults from writeback
       // must take priority as that instruction is architecturally ordered before the one in ID/EX.
-      if (store_err_q) begin
+      // TIDE-ISA trap: highest priority (ISA section 6.5). The FLUSH-state
+      // context mux (tide_trap_ctx_o) selects kill / async / sync.
+      if (TIDE_EN & tide_trap_pend_q) begin
+        tide_trap_prio = 1'b1;
+      end else if (store_err_q) begin
         store_err_prio = 1'b1;
       end else if (load_err_q) begin
         load_err_prio  = 1'b1;
@@ -338,6 +380,7 @@ module ibex_controller import ibex_pkg::*; #(
   end else begin : g_no_wb_exceptions
     always_comb begin
       instr_fetch_err_prio = 0;
+      tide_trap_prio         = 1'b0;
       illegal_insn_prio    = 0;
       ecall_insn_prio      = 0;
       ebrk_insn_prio       = 0;
@@ -347,7 +390,10 @@ module ibex_controller import ibex_pkg::*; #(
       cheriot_ex_err_prio    = 1'b0;
       cheriot_asr_err_prio   = 1'b0;
 
-      if (instr_fetch_err) begin
+      // TIDE-ISA trap: highest priority (ISA section 6.5).
+      if (TIDE_EN & tide_trap_pend_q) begin
+        tide_trap_prio = 1'b1;
+      end else if (instr_fetch_err) begin
         instr_fetch_err_prio = 1'b1;
       end else if (illegal_insn_q) begin
         illegal_insn_prio = 1'b1;
@@ -371,7 +417,8 @@ module ibex_controller import ibex_pkg::*; #(
   end
 
   `ASSERT_IF(IbexExceptionPrioOnehot,
-             $onehot({instr_fetch_err_prio,
+             $onehot({tide_trap_prio,
+                      instr_fetch_err_prio,
                       illegal_insn_prio,
                       ecall_insn_prio,
                       ebrk_insn_prio,
@@ -701,6 +748,19 @@ module ibex_controller import ibex_pkg::*; #(
           halt_if = 1'b1;
         end
 
+        // TIDE-ISA (ch09 section 10 / ISA section 2.5): interrupt or debug
+        // entry while a TIDE instruction is blocked in ID. mepc/dpc = the
+        // blocked instruction's PC; it is flushed and re-executed after
+        // mret/dret (request level re-asserts, timeout count accumulates).
+        // Suppressed when a TIDE trap is pending (special_req covers the
+        // sync / kill / async-immediate paths via exc_req_d).
+        if (TIDE_EN & tide_irq_ready_i & ~special_req & ~tide_kill_req_d) begin
+          if (enter_debug_mode) begin
+            ctrl_fsm_ns = DBG_TAKEN_ID;
+          end else if (handle_irq) begin
+            ctrl_fsm_ns = IRQ_TAKEN_ID;
+          end
+        end
         if (!stall && !special_req && !id_wb_pending) begin
           if (enter_debug_mode) begin
             // enter debug mode
@@ -720,6 +780,16 @@ module ibex_controller import ibex_pkg::*; #(
           end
         end
 
+        // TIDE-ISA: async TIDE trap (commit-time error, initiating
+        // instruction already retired): take it at the next clean
+        // instruction boundary, mepc = next fetch PC (ISA section 5.4). It
+        // is an exception, not an interrupt, so it is not gated by MIE; a
+        // pending regular interrupt/debug entry takes this boundary first.
+        if (!stall && !special_req && !id_wb_pending && TIDE_EN &
+            tide_async_valid_q & ~handle_irq & ~enter_debug_mode) begin
+          ctrl_fsm_ns = IRQ_TAKEN;
+          halt_if     = 1'b1;
+        end
       end // DECODE
 
       IRQ_TAKEN: begin
@@ -756,9 +826,57 @@ module ibex_controller import ibex_pkg::*; #(
           end else begin // irqs_i.irq_timer
             exc_cause_o = ExcCauseIrqTimerM;
           end
+        end else if (TIDE_EN & tide_async_valid_q) begin
+          // TIDE-ISA: async TIDE trap taken at this clean boundary
+          // (ISA section 5.4 / 6.5). mepc = next fetch PC, mcause = 24.
+          pc_set_o         = 1'b1;
+          csr_save_if_o    = 1'b1;
+          csr_save_cause_o = 1'b1;
+          exc_cause_o      = ExcCauseTide;
+          // exception, not interrupt: direct (non-vectored) vector
+          exc_pc_mux_o     = debug_mode_q ? EXC_PC_DBG_EXC : EXC_PC_EXC;
         end
 
         ctrl_fsm_ns = DECODE;
+      end
+
+      // TIDE-ISA: interrupt taken while a TIDE instruction is blocked in ID
+      // (ISA section 2.5 interrupt safety, ch09 section 10). Identical to
+      // IRQ_TAKEN except mepc comes from the (flushed) PC in ID and the
+      // blocked instruction is removed from the pipeline.
+      IRQ_TAKEN_ID: begin
+        pc_mux_o     = PC_EXC;
+        exc_pc_mux_o = EXC_PC_IRQ;
+
+        if (handle_irq) begin
+          pc_set_o         = 1'b1;
+
+          csr_save_id_o    = 1'b1;
+          csr_save_cause_o = 1'b1;
+
+          if (irq_nm && !nmi_mode_q) begin
+            exc_cause_o =
+              irq_nm_ext_i ? ExcCauseIrqNm :
+                             '{irq_ext: 1'b0, irq_int: 1'b1, lower_cause: irq_nm_int_cause};
+
+            if (irq_nm_int & !irq_nm_ext_i) begin
+              csr_mtval_o = irq_nm_int_mtval;
+            end
+
+            nmi_mode_d  = 1'b1; // enter NMI mode
+          end else if (irqs_i.irq_fast != 15'b0) begin
+            exc_cause_o = '{irq_ext: 1'b1, irq_int: 1'b0, lower_cause: {1'b1, mfip_id}};
+          end else if (irqs_i.irq_external) begin
+            exc_cause_o = ExcCauseIrqExternalM;
+          end else if (irqs_i.irq_software) begin
+            exc_cause_o = ExcCauseIrqSoftwareM;
+          end else begin // irqs_i.irq_timer
+            exc_cause_o = ExcCauseIrqTimerM;
+          end
+        end
+
+        flush_id     = 1'b1;
+        ctrl_fsm_ns  = DECODE;
       end
 
       DBG_TAKEN_IF: begin
@@ -796,7 +914,9 @@ module ibex_controller import ibex_pkg::*; #(
         exc_pc_mux_o  = EXC_PC_DBD;
 
         // update dcsr and dpc
-        if (ebreak_into_debug && !debug_mode_q) begin // ebreak with forced entry
+        if ((ebreak_into_debug && !debug_mode_q) || tide_dbg_capture_q) begin
+          // ebreak with forced entry, or TIDE-ISA debug entry while a
+          // TIDE instruction is blocked in ID (dpc = that instruction's PC)
 
           // dpc (set to the address of the EBREAK, i.e. set to PC in ID stage)
           csr_save_cause_o = 1'b1;
@@ -846,6 +966,16 @@ module ibex_controller import ibex_pkg::*; #(
 
           // Exception/fault prioritisation logic will have set exactly 1 X_prio signal
           unique case (1'b1)
+            tide_trap_prio: begin
+              // TIDE-ISA: TQ_* trap (sync precise, fail-stop kill, or async
+              // taken at the current execution point). mcause = 24; details
+              // in tqcause/tqfault (latched from tide_trap_ctx_o by the CSR
+              // file); no mtval (ISA section 5.4). mepc = the faulting /
+              // blocked TIDE instruction in ID (default pc_id path /
+              // csr_save_id with the writeback stage).
+              exc_cause_o = ExcCauseTide;
+              csr_mtval_o = 32'd0;
+            end
             instr_fetch_err_prio: begin
               if ((BaseIsa == BaseIsaRV32IorCHERIoT) & (cheriot_enable_i == IbexMuBiOn) &
                   instr_fetch_cheriot_acc_vio_i) begin  // tag violation
@@ -1027,6 +1157,91 @@ module ibex_controller import ibex_pkg::*; #(
   assign instr_valid_clear_o = ~(stall | retain_id) | flush_id;
 
   // update registers
+  // TIDE-ISA: trap event latches and CSR trap-context (ch09 section 6.3).
+  // tide_trap_q captures the DD event payload on the pulse cycle (the pulse
+  // is one cycle, the save happens in FLUSH / IRQ_TAKEN). tide_kill_q /
+  // tide_async_pend_q mark a TIDE precise trap consumed in FLUSH;
+  // tide_async_q / tide_async_valid_q hold a commit-time error for delivery
+  // at the next clean instruction boundary.
+  always_ff @(posedge clk_i or negedge rst_ni) begin : update_tide_regs
+    if (!rst_ni) begin
+      tide_trap_pend_q   <= 1'b0;
+      tide_kill_q        <= 1'b0;
+      tide_async_pend_q  <= 1'b0;
+      tide_async_valid_q <= 1'b0;
+      tide_dbg_capture_q <= 1'b0;
+      tide_trap_q        <= '{valid: 1'b0, is_failstop: 1'b0, tqcause: TideTqCauseLate,
+                              trap_class: TideTrapClassSync, target_is_queue: 1'b0,
+                              target_idx: 5'd0, ts: 48'd0, gid: 32'd0};
+      tide_async_q       <= '{valid: 1'b0, is_failstop: 1'b0, tqcause: TideTqCauseLate,
+                              trap_class: TideTrapClassAsync, target_is_queue: 1'b0,
+                              target_idx: 5'd0, ts: 48'd0, gid: 32'd0};
+    end else begin
+      if (TIDE_EN & tide_trap_i.valid) begin
+        tide_trap_q <= tide_trap_i;
+      end
+      tide_trap_pend_q <= TIDE_EN & (ctrl_fsm_cs != FLUSH) &
+                           (tide_id_trap_i.valid | tide_kill_req_d | tide_async_pulse_d);
+      tide_kill_q        <= tide_kill_req_d;
+      tide_async_pend_q  <= tide_async_pulse_d;
+      // boundary-delivered async TIDE trap: latched when no TIDE instruction
+      // is blocked (taken in IRQ_TAKEN at the next clean boundary)
+      if (TIDE_EN & tide_trap_i.valid & ~tide_trap_i.is_failstop & ~tide_block_i) begin
+        tide_async_valid_q <= 1'b1;
+        tide_async_q       <= tide_trap_i;
+      end else if (ctrl_fsm_cs == IRQ_TAKEN & tide_async_valid_q & ~handle_irq) begin
+        tide_async_valid_q <= 1'b0; // consumed by the async arm
+      end
+      // debug entry capture for the blocked-TIDE debug path (consumed in
+      // DBG_TAKEN_ID the next cycle)
+      tide_dbg_capture_q <= (ctrl_fsm_cs == DECODE) & TIDE_EN & tide_irq_ready_i &
+                            ~special_req & ~tide_kill_req_d & enter_debug_mode;
+    end
+  end
+
+  // Trap context for ibex_cs_registers (latched there when csr_save_cause &
+  // mcause == 24). Priority per ISA section 6.5: fail-stop kill > local
+  // async > local sync.
+  always_comb begin : gen_tide_trap_ctx
+    tide_trap_ctx_o = '{valid: 1'b0, trap_class: TideTrapClassSync, tqcause: TideTqCauseLate,
+                        target_is_queue: 1'b0, target_idx: 5'd0, ts: 48'd0, gid: 32'd0};
+    if (TIDE_EN) begin
+      if ((ctrl_fsm_cs == FLUSH) & exc_req_q & tide_trap_pend_q) begin
+        if (tide_kill_q) begin
+          // killed by fail-stop broadcast: TQ_UNDERRUN class 2; fault fields
+          // point at the stop's original cause (ch09 section 9)
+          tide_trap_ctx_o = '{valid: 1'b1, trap_class: TideTrapClassHaltKill,
+                              tqcause: TideTqCauseUnderrun,
+                              target_is_queue: tide_trap_q.target_is_queue,
+                              target_idx: tide_trap_q.target_idx,
+                              ts: tide_trap_q.ts, gid: tide_trap_q.gid};
+        end else if (tide_async_pend_q) begin
+          tide_trap_ctx_o = '{valid: 1'b1, trap_class: tide_trap_q.trap_class,
+                              tqcause: tide_trap_q.tqcause,
+                              target_is_queue: tide_trap_q.target_is_queue,
+                              target_idx: tide_trap_q.target_idx,
+                              ts: tide_trap_q.ts, gid: tide_trap_q.gid};
+        end else begin
+          tide_trap_ctx_o = '{valid: 1'b1, trap_class: TideTrapClassSync,
+                              tqcause: tide_id_trap_i.tqcause,
+                              target_is_queue: tide_id_trap_i.target_is_queue,
+                              target_idx: tide_id_trap_i.target_idx,
+                              ts: tide_id_trap_i.ts, gid: tide_id_trap_i.gid};
+        end
+      end else if ((ctrl_fsm_cs == IRQ_TAKEN) & tide_async_valid_q & ~handle_irq) begin
+        tide_trap_ctx_o = '{valid: 1'b1, trap_class: TideTrapClassAsync,
+                            tqcause: tide_async_q.tqcause,
+                            target_is_queue: tide_async_q.target_is_queue,
+                            target_idx: tide_async_q.target_idx,
+                            ts: tide_async_q.ts, gid: tide_async_q.gid};
+      end
+    end
+  end
+
+  // tide_halt_i is consumed by the ID stage (TQ_HALTED on new TIDE
+  // instructions); the controller arbitrates on the event pulse only.
+  // (ch09 section 6.3 freezes the port on the controller.)
+  assign unused_tide_halt_i = tide_halt_i;
   always_ff @(posedge clk_i or negedge rst_ni) begin : update_regs
     if (!rst_ni) begin
       ctrl_fsm_cs             <= RESET;
