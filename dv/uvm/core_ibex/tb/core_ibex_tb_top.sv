@@ -269,7 +269,7 @@ module core_ibex_tb_top;
       assign tide_gc_realign_w = ~(&dd_init_realign_q);
 
       tide_dd_top #(
-        .NHART(1), .NCH(16), .NRQ(16), .TQ_DEPTH(32),
+        .NCH(16), .NRQ(16), .TQ_DEPTH(32),
         .RQ_DEPTH(4), .TQ_GUARD(8), .NSYNC_SET(16), .XBOARD_K(2)
       ) u_tide_dd_top (
         .clk_i(clk), .rst_ni(rst_n), .realign_i(tide_gc_realign_w),
@@ -288,8 +288,8 @@ module core_ibex_tb_top;
         .rq_idx_i(tide_rq_req_w.rq_idx),
         .rq_valid_o(tide_rq_rsp_w.valid),
         .rq_result_o(tide_rq_rsp_w.result),
-        .sync_valid_i({tide_sync_req_w.valid}),
-        .sync_gid_i({tide_sync_req_w.gid}),
+        .sync_valid_i(tide_sync_req_w.valid),
+        .sync_gid_i(tide_sync_req_w.gid),
         .sync_anchor_o(tide_sync_anchor_w),
         .trap_valid_o(tide_trap_w.valid),
         .trap_failstop_o(tide_trap_w.is_failstop),

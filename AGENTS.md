@@ -216,7 +216,7 @@ TIDE 指令的副作用必须在指令**不可撤销之后**发生（ISA §3.3 /
 | RTL 参数 | 含义 | 默认值 | 约束 / 暴露途径 |
 |---|---|---|---|
 | `TIDE_EN` | 综合期总开关 | `1` | 置 0 须**逐拍回归上游 Ibex**（不变量 I1） |
-| `NHART` | hart 数 | `1`（版本 A） | 所有按 hart 复制的结构一律**按 N 参数化** |
+| `NHART` | 系统 hart 数（CSR 视图） | `1`（版本 A） | 每个 DD 实例只服务单 hart；多 hart 在平台层实例化多个 DD |
 | `NGRID` | 栅组数 | `1` | ≤ 16（受 QSYNC `imm[3:0]` 所限）；`tqgrid` |
 | `NCH` | 通道数 | `16` | ≤ 32（受 QTRIG 32 位掩码所限）；`tqcfg[22:17]` |
 | `NRQ` | 读出队列数 | `16` | ≤ 32（受 QLOAD 5 位队列号所限）；`tqcfg[28:23]` |
@@ -249,7 +249,7 @@ TIDE 指令的副作用必须在指令**不可撤销之后**发生（ISA §3.3 /
 | I2 | 仅 M 模式；`PMP`、`SecureIbex`、`ICache`、`RV32B` 关闭 |
 | I3 | 2 级流水：`WritebackStage = 0`、`BranchTargetALU = 0`、`BranchPredictor = 0` |
 | I4 | 基线 ISA 为 `BaseIsaRV32I`（**非** `BaseIsaRV32IorCHERIoT`）；CHERIoT 逻辑不改动、不参与 TIDE 构建 |
-| I5 | 版本 A：`NHART = 1`、`NGRID = 1`；但所有结构按 N 参数化，接口在版本 A 即就位 |
+| I5 | 版本 A：`NHART = 1`、`NGRID = 1`；每个 DD 实例单 hart，多 hart 通过平台层多实例组合 |
 | I6 | **CD 永不阻塞于时间**：阻塞原因只能是**数据、空间、汇合**三者 |
 | I7 | 不可推测副作用：TIDE 指令副作用必须在不可撤销之后发生（本核顺序发射、无推测） |
 | I8 | 阻塞型指令遵循**可重启模型**：无状态谓词、原子退休、中断安全、fail-stop 杀伤 |
