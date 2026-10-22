@@ -29,6 +29,8 @@
       # interface needs. The -Wno-error=int-conversion Xcflags entry from
       # upstream is dropped too: it is unknown to the container's gcc-7
       # and VCS turns that unknown-option diagnostic into a hard error.
+      # C++ DPI sources use g++-7 because the default g++-4.4 cannot parse
+      # the C++11/14 Spike cosim headers. date.c remains compatible with gnu89.
       - >-
         vcs
           -full64
@@ -41,12 +43,13 @@
           +define+UVM_REGEX_NO_DPI
           -timescale=1ns/10ps
           -licqueue
-          -LDFLAGS '-Wl,--no-as-needed'
+          -LDFLAGS '-Wl,--no-as-needed -no-pie'
           -Mdir=<tb_dir>/vcs_simv.csrc
           -o <tb_dir>/vcs_simv
           -debug_access+pp
           -xlrm uniq_prior_final
-          -CFLAGS '--std=c99 -fno-extended-identifiers'
+          -cpp /usr/bin/g++-7
+          -CFLAGS '-fno-extended-identifiers'
           -lca -nogenid_db
           -debug_access+f
           -Xcflags='-Wno-error=implicit-function-declaration'

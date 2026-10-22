@@ -160,3 +160,38 @@ synopsys-cli vcs -full64 -sverilog -timescale=1ns/1ps \
 
 结果：VCS elaboration/link PASS；导出包只含 `.sv/.svh`、`EXPORT_FILES.f` 和
 `MANIFEST.sha256`，不含 FuseSoC/Makefile/脚本/构建产物。
+## 2026-10-22 A3 单 hart 改造后复验
+
+单 hart DD 端口改造后，原 A3 证据不再足够新。此前 `out_single_hart` 已编译到 testbench，但 Spike DPI 被容器默认 `g++ 4.4 + -std=c99` 阻塞。现已修正 UVM VCS 配置：
+
+- C++ DPI 使用 `/usr/bin/g++-7`；
+- 移除对 C++ 源不合法的 `--std=c99`；
+- 链接增加 `-no-pie`，兼容容器内 VCS 静态对象；
+- C 源码仍由 gcc 编译，`date.c` 使用默认 gnu89 兼容模式。
+
+复验命令：
+
+```bash
+cd tide_cd/dv/uvm/core_ibex
+export PATH=/opt/py313/bin:/tools/riscv/bin:$PATH
+export PKG_CONFIG_PATH=/tools/riscv-isa-sim/lib/pkgconfig:$PKG_CONFIG_PATH
+export LD_LIBRARY_PATH=/tools/riscv-isa-sim/lib:$LD_LIBRARY_PATH
+export RISCV_TOOLCHAIN=/tools/riscv
+export RISCV_GCC=/tools/riscv/bin/riscv32-unknown-elf-gcc
+export RISCV_OBJCOPY=/tools/riscv/bin/riscv32-unknown-elf-objcopy
+IBEX_CONFIG_FILE=dv/uvm/core_ibex/tide_small_config.yaml \
+  make OUT=out_single_hart_v4 IBEX_CONFIG=tide_small SIMULATOR=vcs ISS=spike \
+       ITERATIONS=1 SEED=9 TEST=tide_qop_smoke WAVES=0 COV=0
+```
+
+结果：
+
+```text
+100.00% PASS 1 PASSED, 0 FAILED
+Co-simulation matched 98 instructions
+--- RISC-V UVM TEST PASSED ---
+UVM_ERROR : 0
+UVM_FATAL : 0
+```
+
+证据：`out_single_hart_v4/run/regr.log`、`out_single_hart_v4/run/tests/tide_qop_smoke.9/rtl_sim_stdstreams.log`。
