@@ -273,6 +273,7 @@ module core_ibex_tb_top;
         .RQ_DEPTH(4), .TQ_GUARD(8), .NSYNC_SET(16), .XBOARD_K(2)
       ) u_tide_dd_top (
         .clk_i(clk), .rst_ni(rst_n), .realign_i(tide_gc_realign_w),
+        .sync_release_i(1'b0), .ext_failstop_i(1'b0),
         .enq_valid_i(tide_enq_req_w.valid),
         .enq_mask_i(tide_enq_req_w.mask),
         .enq_code_i(tide_enq_req_w.code),
@@ -291,6 +292,7 @@ module core_ibex_tb_top;
         .sync_valid_i(tide_sync_req_w.valid),
         .sync_gid_i(tide_sync_req_w.gid),
         .sync_anchor_o(tide_sync_anchor_w),
+        .elapsed_o(),
         .trap_valid_o(tide_trap_w.valid),
         .trap_failstop_o(tide_trap_w.is_failstop),
         .trap_cause_o(dd_trap_cause),
