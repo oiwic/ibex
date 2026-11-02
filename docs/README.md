@@ -267,6 +267,7 @@ make COV=1                                                             # 带覆�
 
 | D17 | QLOAD 写回从真实 DD result 端口取数；LATEST 诊断固定取完成记录 result[31:0]，不取 T_done | result 通道由 tide_rq_rsp_t 冻结；记录布局为 {result[79:48], T_done[47:0]}。stub 修复见 dv/uvm/core_ibex/tide/tide_dd_stub.sv:503 | 定 |
 | D18 | TIDE 同步 enqueue 错误在 MULTI_CYCLE 中被 flush 时，ID FSM 必须回到 FIRST_CYCLE | TQ_LATE 先使 QTRIG 进入 MULTI_CYCLE，再由 controller 精确异常 flush；不复位 FSM 会导致 IbexMoveToFirstCycleWhenIdReady 失败。修复位于 rtl/ibex_id_stage.sv:1185，仅在 TIDE_EN && flush_id 生效 | 定 |
+| D19 | CD 侧 CSR 影子的 WARL 掩码落在**写侧单点**（tqerr_policy 掩 [10:0]、tqsink 掩 [NRQ-1:0]），**不**把 0x7C4/0x7C6 的读转发给 DD | 与 tqidx 既有做法（rtl/ibex_cs_registers.sv:1123 写掩 [7:0]、:793 读掩高位）和 DD 写侧（../tide_dd/rtl/tide_dd_top.sv:299,301）一致；读转发会拉长 CSR 读时序路径并动冻结适配器协议。规格依据 ../tide_doc/data/tide_csr_map.csv:22,24；修复前复现 ../tide_exp/build/directed_tide_csr.log:46。详见 **FOCUS.md F16** | 定 |
 
 ---
 

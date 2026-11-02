@@ -600,6 +600,14 @@ fusesoc --cores-root . run --target=lint --tool=verilator lowrisc:ibex:ibex_top_
 **搜索模式**：synchronous TIDE enqueue error、id_fsm_q <= FIRST_CYCLE。
 **怎么验证**：small 配置 + 真实 DD 跑 tide_qop_smoke，覆盖 QTRIG C3 迟到。
 
+## F16 CD 侧 CSR 影子必须自带 WARL 掩码
+
+**现象**：tqerr_policy / tqsink 的 CD 影子在写侧直接存 `csr_wdata_int`，读侧原样返回；这两个 CSR 不在 `tide_csr_fwd_read` 里，软件看到的是未掩码值。
+**后果**：`tqerr_policy` 写 `0xFFFF_FFFF` 读回 `0xFFFF_FFFF`（应为 `0x7FF`）；`tqsink` 读回整 32 位（应为 NRQ 位）。软件可见读回违反冻结映射（WARL 语义缺陷）；DD 自身写侧自己掩码，停机策略不受影响。
+**硬规则**：CD 影子的每一个"部分有效位"寄存器，写侧必须单点掩码，读侧保持原样（参照 tqidx：写掩 `[7:0]`、读再掩高位）。不要改成读转发到 DD —— 会拉长 CSR 读时序路径并动冻结适配器协议。
+**证据**：`rtl/ibex_cs_registers.sv:786,800`（读回影子）、`:1117,1131`（写侧掩码，修复后）、`:1123`（tqidx 对照）、`:1306-1309`（`tide_csr_fwd_read` 不含 0x7C4/0x7C6）；`../tide_doc/data/tide_csr_map.csv:22,24`（11 位 / NRQ 位）；`../tide_dd/rtl/tide_dd_top.sv:299,301`（DD 写侧掩码）；复现 `../tide_exp/build/directed_tide_csr.log:46`（修复前 `FAIL line 56 got=ffffffff exp=000007ff`）。
+**搜索模式**：`tide_tqerr_policy_d`、`tide_tqsink_d`、`CSR_TQERR_POLICY`、`CSR_TQSINK`、`tide_csr_fwd_read`。
+**怎么验证**：`tide_exp` 的 `make directed-verify`，tide_csr 用例 0x7C4 写全 1 读回 0x7FF、0x7C6 写全 1 读回 1（NRQ=1 构建）。
 
 ## 汇总：改代码前先扫一眼这张表
 
@@ -620,6 +628,7 @@ fusesoc --cores-root . run --target=lint --tool=verilator lowrisc:ibex:ibex_top_
 | F13 | `make lint-core-tracing` 的 core 名过期 | **改用 `lowrisc:ibex:ibex_top_tracing`** | ★ |
 | F14 | `ibex_configs.yaml` 全键强制 | `TIDE_EN` **走 `.core` 参数，别加进 yaml** | ★★★ |
 | F15 | TIDE 同步错误 flush 后 FSM 未复位 | TIDE_EN && flush_id 时回 FIRST_CYCLE | ★★★ |
+| F16 | CD 影子缺 WARL 掩码 | 部分有效位寄存器写侧单点掩码，读侧不动 | ★★ |
 
 ### 新增本文条目的模板
 

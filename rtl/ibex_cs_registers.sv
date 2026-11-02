@@ -1110,8 +1110,11 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*, ibex_tide_pkg:
         end
         CSR_TQERR_POLICY: begin
           if (TIDE_EN) begin
+            // WARL: bits [10:0] are the stop-on-detect bitmap (tide_csr_map
+            // 0x7C4); the reserved upper bits read back as zero. Mask on the
+            // write so the CD shadow matches the DD mask (tide_dd_top 0x7c4).
             tide_tqerr_policy_we = 1'b1;
-            tide_tqerr_policy_d  = csr_wdata_int;
+            tide_tqerr_policy_d  = {21'b0, csr_wdata_int[10:0]};
           end
         end
         CSR_TQIDX: begin
@@ -1122,8 +1125,10 @@ module ibex_cs_registers import ibex_pkg::*, ibex_cheriot_pkg::*, ibex_tide_pkg:
         end
         CSR_TQSINK: begin
           if (TIDE_EN) begin
+            // WARL: one sink bit per readout queue (tide_csr_map 0x7C6);
+            // bits [31:NRQ] read back as zero.
             tide_tqsink_we = 1'b1;
-            tide_tqsink_d  = csr_wdata_int;
+            tide_tqsink_d  = 32'(csr_wdata_int[NRQ-1:0]);
           end
         end
         CSR_TQFLUSH: begin
