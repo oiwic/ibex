@@ -16,8 +16,7 @@
 //   - readout queues with the identity channel->queue map, QLOAD pop
 //   - QSYNC release after SYNC_LAT ticks (anchor pulse)
 //   - GC / elapsed counters, fail-stop / halt state, P2 realignment
-//   - the CSR split bus (RO readback + RW mirror + W1S actions) and the
-//     MMIO configuration window (capability block + generic RW storage)
+//   - the CSR split bus (RO readback + RW mirror + W1S actions)
 //
 // This stub is NOT Phase 2 compliance evidence (top-level AGENTS.md
 // section 6, rule 9): Phase 2 evidence must come from the real
@@ -50,10 +49,7 @@ module tide_dd_stub
     output logic            halt_o,
     // CSR split bus (same-cycle combinational response, frozen protocol)
     input  tide_csr_req_t   csr_req_i,
-    output tide_csr_rsp_t   csr_rsp_o,
-    // MMIO configuration plane (same-cycle response; the DUT registers it)
-    input  tide_mmio_req_t  mmio_req_i,
-    output tide_mmio_rsp_t  mmio_rsp_o
+    output tide_csr_rsp_t   csr_rsp_o
   );
 
   localparam int CH_CNT_W   = $clog2(TQ_DEPTH) + 1;
@@ -61,8 +57,6 @@ module tide_dd_stub
   localparam int RQ_CNT_W   = $clog2(RQ_DEPTH) + 1;
   localparam int RQ_IDX_W   = $clog2(RQ_DEPTH);
   localparam logic [31:0] TIDE_STUB_SCHEMA = 32'h0001_0001; // v1, vendor 0
-  localparam logic [31:0] TIDE_STUB_CAP    = 32'h0001_0001; // capability block
-  localparam int MMIO_WORDS = 16384;                        // 64 KB window
 
   function automatic logic [31:0] sat_inc(input logic [31:0] v);
     sat_inc = (v == 32'hFFFF_FFFF) ? v : v + 32'd1;
@@ -101,8 +95,6 @@ module tide_dd_stub
   logic [31:0] sync_cnt_q;
   logic        sync_stall_q;
   logic        sync_stall_req = 1'b0; // task-only; zero-init (X would wedge the anchor FSM)
-  // MMIO storage (capability block 0x0000-0x0FFF is RO)
-  logic [31:0] mmio_mem [0:MMIO_WORDS-1];
 
   // ---------------- test stimulus request lines ---------------------------
   logic        realign_req = 1'b0;
@@ -290,31 +282,6 @@ module tide_dd_stub
         12'hFCA:   csr_rsp_o.rdata = {16'b0, gamma49[47:32]};
         default:   csr_rsp_o.rdata = 32'd0;
       endcase
-    end
-  end
-
-  // ---------------- MMIO configuration plane ------------------------------
-  always_comb begin : gen_mmio_rsp
-    mmio_rsp_o = '{valid: mmio_req_i.valid, rdata: 32'd0, err: 1'b0};
-    if (mmio_req_i.valid) begin
-      mmio_rsp_o.rdata = (mmio_req_i.addr[15:12] == 4'd0) ?
-                         TIDE_STUB_CAP : mmio_mem[mmio_req_i.addr[14:2]];
-    end
-  end
-
-  always_ff @(posedge clk or negedge rst_n) begin : mmio_mem_reg
-    if (!rst_n) begin
-      for (int i = 0; i < MMIO_WORDS; i++) mmio_mem[i] <= 32'd0;
-    end else if (mmio_req_i.valid & mmio_req_i.write &
-                 (mmio_req_i.addr[15:12] != 4'd0)) begin
-      if (mmio_req_i.be[0]) mmio_mem[mmio_req_i.addr[14:2]][ 7: 0] <=
-                            mmio_req_i.wdata[ 7: 0];
-      if (mmio_req_i.be[1]) mmio_mem[mmio_req_i.addr[14:2]][15: 8] <=
-                            mmio_req_i.wdata[15: 8];
-      if (mmio_req_i.be[2]) mmio_mem[mmio_req_i.addr[14:2]][23:16] <=
-                            mmio_req_i.wdata[23:16];
-      if (mmio_req_i.be[3]) mmio_mem[mmio_req_i.addr[14:2]][31:24] <=
-                            mmio_req_i.wdata[31:24];
     end
   end
 

@@ -119,8 +119,6 @@ module core_ibex_tb_top;
   logic                          tide_halt_w;
   ibex_tide_pkg::tide_csr_req_t  tide_csr_req_w;
   ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_w;
-  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_w;
-  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_w;
   ibex_top_tracing #(
     .BaseIsa              (BaseIsa             ),
     .PMPEnable            (PMPEnable           ),
@@ -241,9 +239,7 @@ module core_ibex_tb_top;
     .tide_trap_i               (tide_trap_w              ),
     .tide_halt_i               (tide_halt_w              ),
     .tide_csr_req_o            (tide_csr_req_w           ),
-    .tide_csr_rsp_i            (tide_csr_rsp_w           ),
-    .tide_mmio_req_o           (tide_mmio_req_w          ),
-    .tide_mmio_rsp_i           (tide_mmio_rsp_w          )
+    .tide_csr_rsp_i            (tide_csr_rsp_w           )
   );
 
   // TIDE-ISA v0.10-rc4 DD side (Phase 1 test double; ch10 section 3.4). The
@@ -310,14 +306,6 @@ module core_ibex_tb_top;
         .csr_rsp_valid_o(tide_csr_rsp_w.valid),
         .csr_rdata_o(tide_csr_rsp_w.rdata),
         .csr_illegal_o(tide_csr_rsp_w.illegal),
-        .mmio_valid_i(tide_mmio_req_w.valid),
-        .mmio_write_i(tide_mmio_req_w.write),
-        .mmio_addr_i(tide_mmio_req_w.addr),
-        .mmio_be_i(tide_mmio_req_w.be),
-        .mmio_wdata_i(tide_mmio_req_w.wdata),
-        .mmio_rsp_valid_o(tide_mmio_rsp_w.valid),
-        .mmio_rsp_rdata_o(tide_mmio_rsp_w.rdata),
-        .mmio_rsp_err_o(tide_mmio_rsp_w.err),
         .commit_valid_o(dd_commit_valid),
         .commit_ts_o(dd_commit_ts),
         .commit_code_o(dd_commit_code),
@@ -353,9 +341,7 @@ module core_ibex_tb_top;
         .trap_o        (tide_trap_w        ),
         .halt_o        (tide_halt_w        ),
         .csr_req_i     (tide_csr_req_w     ),
-        .csr_rsp_o     (tide_csr_rsp_w     ),
-        .mmio_req_i    (tide_mmio_req_w    ),
-        .mmio_rsp_o    (tide_mmio_rsp_w    )
+        .csr_rsp_o     (tide_csr_rsp_w     )
       );
 `endif
     end else begin : gen_tide_dd_off
@@ -367,12 +353,10 @@ module core_ibex_tb_top;
       assign tide_trap_w        = '0;
       assign tide_halt_w        = 1'b0;
       assign tide_csr_rsp_w     = '0;
-      assign tide_mmio_rsp_w    = '0;
       // TIDE_EN=0: the core's TIDE request outputs are unused.
       logic unused_tide_reqs;
       assign unused_tide_reqs = |{tide_enq_req_w, tide_rq_req_w,
-                                   tide_sync_req_w, tide_csr_req_w,
-                                   tide_mmio_req_w};
+                                   tide_sync_req_w, tide_csr_req_w};
     end
   endgenerate
 

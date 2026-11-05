@@ -136,7 +136,6 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   input  ibex_tide_pkg::tide_trap_t      tide_trap_i,
   input  logic                           tide_halt_i,
   input  ibex_tide_pkg::tide_csr_rsp_t   tide_csr_rsp_i,
-  input  ibex_tide_pkg::tide_mmio_rsp_t  tide_mmio_rsp_i,
 
   output ibex_mubi_t                   lockstep_cmp_en_o,
   output logic                         data_req_shadow_o,
@@ -289,7 +288,6 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     ibex_tide_pkg::tide_trap_t     tide_trap;
     logic                          tide_halt;
     ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp;
-    ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp;
   } delayed_inputs_t;
 
   delayed_inputs_t [LockstepOffset-1:0] shadow_inputs_q;
@@ -382,7 +380,6 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   assign shadow_inputs_in.tide_trap         = tide_trap_i;
   assign shadow_inputs_in.tide_halt         = tide_halt_i;
   assign shadow_inputs_in.tide_csr_rsp      = tide_csr_rsp_i;
-  assign shadow_inputs_in.tide_mmio_rsp     = tide_mmio_rsp_i;
 
   ///////////////////
   // Output delays //
@@ -483,10 +480,9 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_sh;
   ibex_tide_pkg::tide_sync_req_t tide_sync_req_sh;
   ibex_tide_pkg::tide_csr_req_t  tide_csr_req_sh;
-  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_sh;
   wire                           unused_tide_sh;
   assign unused_tide_sh = |{tide_enq_req_sh, tide_rq_pop_sh, tide_sync_req_sh,
-                             tide_csr_req_sh, tide_mmio_req_sh};
+                             tide_csr_req_sh};
 
   ibex_core #(
     .PMPEnable            ( PMPEnable            ),
@@ -663,9 +659,7 @@ module ibex_lockstep import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     .tide_trap_i            (shadow_inputs_q[0].tide_trap),
     .tide_halt_i            (shadow_inputs_q[0].tide_halt),
     .tide_csr_req_o         (tide_csr_req_sh),
-    .tide_csr_rsp_i         (shadow_inputs_q[0].tide_csr_rsp),
-    .tide_mmio_req_o        (tide_mmio_req_sh),
-    .tide_mmio_rsp_i        (shadow_inputs_q[0].tide_mmio_rsp)
+    .tide_csr_rsp_i         (shadow_inputs_q[0].tide_csr_rsp)
   );
 
   // Extract cap data from shadow core's unified cap ECC output (cap in lower REGCAP_W bits)

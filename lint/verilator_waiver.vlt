@@ -111,8 +111,8 @@ lint_off -rule VARHIDDEN -file "*/rtl/ibex_lockstep.sv" -match "*'TIDE_EN'*"
 // them; validity is guaranteed by the always-ready same-cycle protocol
 // (rsp.valid == req.valid) and by the dedicated control flags below, and
 // is checked by SVA in the DV environment rather than by the CD datapath.
-//  - tide_mmio_rsp_t.valid / tide_csr_rsp_t.valid: redundant with the
-//    request itself (always-ready, rsp in the same cycle as req).
+//  - tide_csr_rsp_t.valid: redundant with the request itself (always-ready,
+//    rsp in the same cycle as req).
 //  - tide_csr_rsp_t.illegal: DD-side protocol completeness; the CD-side
 //    reaction to it is not defined by the ISA, so the CD ignores it.
 //  - tide_trap_ctx_t.valid: the trap-save latch condition uses the source
@@ -122,7 +122,6 @@ lint_off -rule VARHIDDEN -file "*/rtl/ibex_lockstep.sv" -match "*'TIDE_EN'*"
 //    is_failstop inputs (tide_kill_req_d / tide_async_pulse_d) and keeps
 //    dedicated flags (tide_trap_pend_q / tide_async_valid_q) for the
 //    registered path; the struct copies of these fields are not read.
-lint_off -rule UNUSED -file "*/rtl/ibex_core.sv" -match "*'tide_mmio_rsp_i'*"
 lint_off -rule UNUSED -file "*/rtl/ibex_cs_registers.sv" -match "*'tide_csr_rsp_i'*"
 lint_off -rule UNUSED -file "*/rtl/ibex_cs_registers.sv" -match "*'tide_trap_snap_q'*"
 lint_off -rule UNUSED -file "*/rtl/ibex_controller.sv" -match "*'tide_trap_q'*"

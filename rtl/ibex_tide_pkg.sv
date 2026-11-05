@@ -226,24 +226,6 @@ package ibex_tide_pkg;
     logic        illegal;
   } tide_csr_rsp_t;
 
-  // CD <-> DD MMIO configuration surface (frozen adapter types).
-  // 16-bit window offset, 32-bit data, byte enables. Always-ready,
-  // 1-cycle (configuration plane; no cycle-accuracy requirement,
-  // ISA section 5.3).
-  typedef struct packed {
-    logic        valid;
-    logic        write;
-    logic [15:0] addr;
-    logic [3:0]  be;
-    logic [31:0] wdata;
-  } tide_mmio_req_t;
-
-  typedef struct packed {
-    logic        valid;
-    logic [31:0] rdata;
-    logic        err;
-  } tide_mmio_rsp_t;
-
   // DD transport-shell <-> backend boundary (frozen adapter types).
   // commit: DD delivers {ts, code} to the channel backend at commit time.
   typedef struct packed {

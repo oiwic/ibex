@@ -88,11 +88,9 @@ module tide_cd_top
   input  logic tide_halt_i,
   input  logic tide_gc_realign_i,
 
-  // 9. TIDE CSR / MMIO configuration surface
+  // 9. TIDE CSR configuration surface
   output tide_csr_req_t tide_csr_req_o,
-  input  tide_csr_rsp_t tide_csr_rsp_i,
-  output tide_mmio_req_t tide_mmio_req_o,
-  input  tide_mmio_rsp_t tide_mmio_rsp_i
+  input  tide_csr_rsp_t tide_csr_rsp_i
 );
 
   /////////////////////////////////
@@ -213,8 +211,6 @@ module tide_cd_top
     .tide_halt_i (tide_halt_i),
     .tide_csr_req_o (tide_csr_req_o),
     .tide_csr_rsp_i (tide_csr_rsp_i),
-    .tide_mmio_req_o (tide_mmio_req_o),
-    .tide_mmio_rsp_i (tide_mmio_rsp_i),
 
     // register file
     .dummy_instr_id_o (dummy_instr_id),

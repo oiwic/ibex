@@ -162,7 +162,6 @@ ${PRJ_DIR}/../tide_dd/rtl/tide_rq.sv
 ${PRJ_DIR}/../tide_dd/rtl/tide_sync.sv
 ${PRJ_DIR}/../tide_dd/rtl/tide_err.sv
 ${PRJ_DIR}/../tide_dd/rtl/tide_csr.sv
-${PRJ_DIR}/../tide_dd/rtl/tide_mmio.sv
 ${PRJ_DIR}/../tide_dd/rtl/tide_xboard.sv
 ${PRJ_DIR}/../tide_dd/rtl/tide_dd_top.sv
 ${PRJ_DIR}/dv/uvm/core_ibex/tide/tide_dd_stub.sv

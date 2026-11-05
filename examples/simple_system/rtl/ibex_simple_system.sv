@@ -217,10 +217,9 @@ module ibex_simple_system (
   ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_w;
   ibex_tide_pkg::tide_sync_req_t tide_sync_req_w;
   ibex_tide_pkg::tide_csr_req_t  tide_csr_req_w;
-  ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_w;
   wire                           unused_tide;
   assign unused_tide = |{tide_enq_req_w, tide_rq_pop_w, tide_sync_req_w,
-                          tide_csr_req_w, tide_mmio_req_w};
+                          tide_csr_req_w};
 
   ibex_top_tracing #(
       .BaseIsa              ( BaseIsa              ),
@@ -345,9 +344,7 @@ module ibex_simple_system (
       .tide_trap_i             ('0),
       .tide_halt_i             (1'b0),
       .tide_csr_req_o          (tide_csr_req_w),
-      .tide_csr_rsp_i          ('0),
-      .tide_mmio_req_o         (tide_mmio_req_w),
-      .tide_mmio_rsp_i         ('0)
+      .tide_csr_rsp_i          ('0)
     );
 
   // SRAM block for instruction and data storage

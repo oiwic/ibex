@@ -147,9 +147,7 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; import i
   input  ibex_tide_pkg::tide_trap_t     tide_trap_i,
   input  logic                          tide_halt_i,
   output ibex_tide_pkg::tide_csr_req_t  tide_csr_req_o,
-  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i,
-  output ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_o,
-  input  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_i
+  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i
 
 );
 
@@ -409,9 +407,7 @@ module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; import i
     .tide_trap_i,
     .tide_halt_i,
     .tide_csr_req_o,
-    .tide_csr_rsp_i,
-    .tide_mmio_req_o,
-    .tide_mmio_rsp_i
+    .tide_csr_rsp_i
   );
 
 `ifdef RVFI

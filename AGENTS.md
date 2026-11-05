@@ -22,7 +22,7 @@
 |---|---|---|---|
 | `tide_isa` | `../tide_isa` | **ISA 规范**（TIDE-ISA v0.10-rc）+ 表达力检验 + 评审报告 | 纯文档仓；指令语义/CSR/`TQ_*` 一律以它为准，本仓不定义 |
 | `tide_doc` | `../tide_doc` | **微架构设计文档**（docs-as-code）+ 冻结接口数据 `data/tide_*.csv` | 文档仓；模块划分/接口信号/参数冻结表以它为准，本仓只落地 |
-| `tide_dd` | `../tide_dd` | **DD 实现**：定时队列 / 读出队列 / 同步 / fail-stop / MMIO（Phase 2） | 实现仓；本仓的 DD stub（`dv/uvm/core_ibex/tide/tide_dd_stub.sv`）只替它模拟接口，**不**在本仓实现 DD 内部逻辑 |
+| `tide_dd` | `../tide_dd` | **DD 实现**：定时队列 / 读出队列 / 同步 / fail-stop（Phase 2） | 实现仓；本仓的 DD stub（`dv/uvm/core_ibex/tide/tide_dd_stub.sv`）只替它模拟接口，**不**在本仓实现 DD 内部逻辑 |
 | `tide_cd` | **本仓** | **CD 实现**：Ibex RTL + TIDE CD 逻辑 + 验证 + 构建（FuseSoC）（Phase 1 主仓） | ✅ 主工作区 |
 
 **权威顺序**：以 `../tide_prj/AGENTS.md` §2 为准，本仓不再重述。
@@ -184,7 +184,7 @@ TIDE 指令的副作用必须在指令**不可撤销之后**发生（ISA §3.3 /
 - `tqcfg` 中的 `NCH` / `NRQ` / `lg2(TQ_DEPTH)` / `lg2(RQ_DEPTH)` 是**综合常量**，**硬连线读回**，不可写；只有 `TQ_GUARD` 与非阻塞位可写。
 - `tqgc` / `tqgch` / `tqtlr` / `tqtlrh` **仅供调试诊断**。**禁止**软件依据 GC 绝对值计算任何事件时间或循环计数（ISA §5.1 规范性注意）——编程模型中的一切时间均为**阶段局部**。
 - `0x7C0` / `0x7C1` 与 Ibex 既有 `CSR_CPUCTRLSTS` / `CSR_SECURESEED` **冲突**（开放项 **O1**）——须回 `../tide_isa` 确认"Ibex 侧安全 CSR 让位"或改配地址，**本仓不得自行改地址**。
-- MMIO 配置（每通道参数表、读出通道配置、DD 模块配置、波形/描述符表、流式采集 DMA）**不占 CSR 编码空间**；地址图见 `../tide_doc/data/tide_addr_map.csv`：TIDE-MMIO 窗口 `0x4001_0000`（64KB）、诊断/冻结读回窗口 `0x4002_0000`（64KB）。
+- 通道参数表、读出通道配置、DD 模块配置、波形/描述符表、流式采集 DMA **不占 CSR 编码空间，也不占本仓地址空间**：TIDE 配置一律走 CSR 指令路径与 DD 后端 / Platform ABI。地址图（`../tide_doc/data/tide_addr_map.csv`）只含 SRAM、系统 MMIO（`0x4000_0000` 起）与 DD 后端寄存器窗口（`0x4003_0000` / `0x4004_0000`）。
 
 ### 4.3 错误模型（ISA §6.6）
 
@@ -307,7 +307,6 @@ CHERIoT 在同一个核里加了一整套 ISA 扩展，是**格式与门控方�
 |---|---|---|---|
 | `rtl/ibex_tide_pkg.sv` | `tide_op_e` / `tide_cause_e` / 跨域结构 / 参数 localparam | `ibex_pkg.core` 的 `files_rtl`（与 `rtl/ibex_cheriot_pkg.sv` 并列） | 冻结 §3、§4 |
 | `rtl/ibex_tide_dd_top.sv` + 子模块 | DD：入队检查器（C0–C4）+ 定时队列 ×`NCH` + 出队比较器 + `elapsed`/`GC` + 读出队列 ×`NRQ` + `LATEST[]` + fail-stop 网络 + QSYNC 汇合 | `ibex_core.core` 的 `files_rtl` | 冻结 §6、第 5 章 |
-| `rtl/ibex_tide_mmio.sv` | MMIO 桥（每通道参数表、DD 模块配置） | 同上 | 冻结 §6 |
 | CD 侧逻辑 | TLR / 入队握手 / 阻塞重试 | **优先并入** `ibex_id_stage.sv`（冻结 §4.3 明确"位于 `id_stage` 旁的旁路寄存器"） | 冻结 §6.2 |
 
 **必须同步更新的 `.core`**（`docs/ENGINEERING.md` E1；**这些 `.core` 全在仓根目录**，不在 `rtl/` 下）
@@ -350,7 +349,7 @@ CHERIoT 在同一个核里加了一整套 ISA 扩展，是**格式与门控方�
 | QSYNC 汇合 | 释放以 `tide_sync_anchor` 单拍脉冲回送，**释放拍同拍**清零 TLR/elapsed、置 anchored，且该拍退休 |
 | 异常与停机 | `tide_trap` 异步到达；`is_failstop = 1` 时仲裁最高优先；fail-stop 必须**杀伤本栅组全部阻塞中 TIDE 指令**并以 `TQ_UNDERRUN` 送达 |
 
-**时钟域**：默认**同钟域**（`clk_i` 与 DD 派发时钟同源），上述单拍语义成立。MMIO 配置口**允许异步**（配置写不要求逐拍确定性）。跨板信号按"打拍同步 + 拍数恒定 + 预约生效"（`XBOARD_K`）处理，**不向 CD 引入非确定延迟**。
+**时钟域**：默认**同钟域**（`clk_i` 与 DD 派发时钟同源），上述单拍语义成立。跨板信号按"打拍同步 + 拍数恒定 + 预约生效"（`XBOARD_K`）处理，**不向 CD 引入非确定延迟**。
 
 ---
 

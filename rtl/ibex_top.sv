@@ -221,9 +221,7 @@ module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide
   input  ibex_tide_pkg::tide_trap_t     tide_trap_i,
   input  logic                          tide_halt_i,
   output ibex_tide_pkg::tide_csr_req_t  tide_csr_req_o,
-  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i,
-  output ibex_tide_pkg::tide_mmio_req_t tide_mmio_req_o,
-  input  ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_i
+  input  ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_i
 
 );
 
@@ -555,9 +553,7 @@ module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide
     .tide_trap_i          (tide_trap_i),
     .tide_halt_i          (tide_halt_i),
     .tide_csr_req_o       (tide_csr_req_o),
-    .tide_csr_rsp_i       (tide_csr_rsp_i),
-    .tide_mmio_req_o      (tide_mmio_req_o),
-    .tide_mmio_rsp_i      (tide_mmio_rsp_i)
+    .tide_csr_rsp_i       (tide_csr_rsp_i)
 
   );
 
@@ -1032,7 +1028,6 @@ module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide
     ibex_tide_pkg::tide_trap_t     tide_trap_local;
     logic                          tide_halt_local;
     ibex_tide_pkg::tide_csr_rsp_t  tide_csr_rsp_local;
-    ibex_tide_pkg::tide_mmio_rsp_t tide_mmio_rsp_local;
 
     assign tide_enq_rsp_local      = tide_enq_rsp_i;
     assign tide_rq_rsp_local       = tide_rq_rsp_i;
@@ -1041,7 +1036,6 @@ module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide
     assign tide_trap_local         = tide_trap_i;
     assign tide_halt_local         = tide_halt_i;
     assign tide_csr_rsp_local      = tide_csr_rsp_i;
-    assign tide_mmio_rsp_local     = tide_mmio_rsp_i;
 
     assign buf_in = {
       hart_id_i,
@@ -1287,7 +1281,6 @@ module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide
       .tide_trap_i                (tide_trap_local),
       .tide_halt_i                (tide_halt_local),
       .tide_csr_rsp_i             (tide_csr_rsp_local),
-      .tide_mmio_rsp_i            (tide_mmio_rsp_local),
 
       .lockstep_cmp_en_o        (lockstep_cmp_en_o),
       .data_req_shadow_o        (data_req_shadow_o),
