@@ -11,7 +11,8 @@
 module ibex_ex_block #(
   parameter ibex_pkg::rv32m_e RV32M           = ibex_pkg::RV32MFast,
   parameter ibex_pkg::rv32b_e RV32B           = ibex_pkg::RV32BNone,
-  parameter bit               BranchTargetALU = 0
+  parameter bit               BranchTargetALU = 0,
+  parameter bit               TIDE_EN         = 1'b0
 ) (
   input  logic                  clk_i,
   input  logic                  rst_ni,
@@ -93,6 +94,16 @@ module ibex_ex_block #(
 
     assign unused_bt_carry = bt_alu_result[32];
     assign branch_target_o = bt_alu_result[31:0];
+  end else if (TIDE_EN) begin : g_tide_branch_target_alu
+    // TIDE keeps BranchTargetALU=0 but builds branch/jump targets with this
+    // dedicated 33-bit adder instead of the main ALU adder, shortening the
+    // PC-redirect cone without changing the two-cycle branch structure.
+    logic [32:0] bt_alu_result;
+    logic        unused_bt_carry;
+
+    assign bt_alu_result   = bt_a_operand_i + bt_b_operand_i;
+    assign unused_bt_carry = bt_alu_result[32];
+    assign branch_target_o = bt_alu_result[31:0];
   end else begin : g_no_branch_target_alu
     // Unused bt_operand signals cause lint errors, this avoids them
     logic [31:0] unused_bt_a_operand, unused_bt_b_operand;
@@ -154,7 +165,8 @@ module ibex_ex_block #(
     );
   end else if (RV32M == RV32MFast || RV32M == RV32MSingleCycle) begin : gen_multdiv_fast
     ibex_multdiv_fast #(
-      .RV32M(RV32M)
+      .RV32M  (RV32M),
+      .TIDE_EN(TIDE_EN)
     ) multdiv_i (
       .clk_i             (clk_i),
       .rst_ni            (rst_ni),

@@ -15,7 +15,16 @@
 `include "prim_assert.sv"
 
 module ibex_multdiv_fast #(
-  parameter ibex_pkg::rv32m_e RV32M = ibex_pkg::RV32MFast
+  parameter ibex_pkg::rv32m_e RV32M   = ibex_pkg::RV32MFast,
+  // TIDE: fully register the multiply path.  The operands and the multiply
+  // control bits are captured in an extra leading cycle, the partial products
+  // run from those registers, and the final product is written into
+  // imd_val_q[0] by the last multiply cycle; a trailing MD_DONE cycle then
+  // presents that registered value at multdiv_result_o.  This keeps both the
+  // multiplier inputs and the RF write port off the RF-read cone and costs two
+  // extra cycles for MUL/MULH.  DIV is unchanged and TIDE_EN=0 keeps the
+  // upstream three/four-cycle multiply timing.
+  parameter bit               TIDE_EN = 1'b0
   ) (
   input  logic             clk_i,
   input  logic             rst_ni,
@@ -71,6 +80,8 @@ module ibex_multdiv_fast #(
   logic [31:0] op_denominator_d;
   logic [31:0] op_numerator_d;
   logic [31:0] op_quotient_d;
+  // TIDE: enable-free next value for op_quotient_q (see the register below).
+  logic [31:0] tide_quotient_d;
   logic [31:0] next_remainder;
   logic [32:0] next_quotient;
   logic [31:0] res_adder_h;
@@ -105,12 +116,20 @@ module ibex_multdiv_fast #(
       op_numerator_q   <= '0;
       op_quotient_q    <= '0;
       div_by_zero_q    <= '0;
-    end else if (div_en_internal) begin
-      div_counter_q    <= div_counter_d;
-      op_numerator_q   <= op_numerator_d;
-      op_quotient_q    <= op_quotient_d;
-      md_state_q       <= md_state_d;
-      div_by_zero_q    <= div_by_zero_d;
+    end else begin
+      if (div_en_internal) begin
+        div_counter_q    <= div_counter_d;
+        op_numerator_q   <= op_numerator_d;
+        if (!TIDE_EN) op_quotient_q <= op_quotient_d;
+        md_state_q       <= md_state_d;
+        div_by_zero_q    <= div_by_zero_d;
+      end
+      // TIDE: the quotient register has no enable, so synthesis cannot add the
+      // data-compare (D != Q) term to a clock-gate enable.  tide_quotient_d is
+      // a pure data function: clear in MD_ABS_A, set one bit in MD_COMP, hold
+      // in every other state.  Same arithmetic, same cycle count as the
+      // upstream register, but no ICG/ECE cone fed by the ALU adder.
+      if (TIDE_EN) op_quotient_q <= tide_quotient_d;
     end
   end
 
@@ -133,7 +152,11 @@ module ibex_multdiv_fast #(
   assign unused_mac_res_ext = mac_res_ext[34];
 
   assign signed_mult      = (signed_mode_i != 2'b00);
-  assign multdiv_result_o = div_sel_i ? imd_val_q_i[0][31:0] : mac_res_d[31:0];
+  // TIDE: a multiply result is always presented from imd_val_q[0] (the only
+  // cycle in which mult_valid is asserted is MD_DONE, which holds the final
+  // result there).  TIDE_EN is a constant, so the mac_res_d arm is pruned in
+  // TIDE builds and the multiplier cone no longer reaches the RF write port.
+  assign multdiv_result_o = (div_sel_i | TIDE_EN) ? imd_val_q_i[0][31:0] : mac_res_d[31:0];
 
   // The single cycle multiplier uses three 17 bit multipliers to compute MUL instructions in a
   // single cycle and MULH instructions in two cycles.
@@ -260,13 +283,41 @@ module ibex_multdiv_fast #(
     assign sva_mul_fsm_idle = mult_state_q == MULL;
 
   // The fast multiplier uses one 17 bit multiplier to compute MUL instructions in 3 cycles
-  // and MULH instructions in 4 cycles.
+  // and MULH instructions in 4 cycles (TIDE builds: 5 and 6 cycles through the
+  // MD_LATCH/MD_DONE states).
   end else begin : gen_mult_fast
     logic [15:0] mult_op_a;
     logic [15:0] mult_op_b;
 
-    typedef enum logic [1:0] {
-      ALBL, ALBH, AHBL, AHBH
+    // TIDE fully-registered multiply: MD_LATCH captures the operands and the
+    // multiply control bits so the multiplier cone starts at a flip-flop;
+    // MD_DONE presents the final product, which the last multiply cycle wrote
+    // into imd_val_q[0], so the RF write port also sees a flip-flop.
+    logic             [31:0] tide_op_a_q;
+    logic             [31:0] tide_op_b_q;
+    logic              [1:0] tide_signed_mode_q;
+    ibex_pkg::md_op_e        tide_operator_q;
+
+    // Multiply operands/control: captured registers in TIDE builds, the
+    // upstream combinational inputs otherwise.  TIDE_EN is an elaboration-time
+    // constant, so each build sees exactly one shape.
+    logic             [31:0] mul_a;
+    logic             [31:0] mul_b;
+    logic              [1:0] mul_signed_mode;
+    ibex_pkg::md_op_e        mul_operator;
+
+    assign mul_a           = TIDE_EN ? tide_op_a_q        : op_a_i;
+    assign mul_b           = TIDE_EN ? tide_op_b_q        : op_b_i;
+    assign mul_signed_mode = TIDE_EN ? tide_signed_mode_q : signed_mode_i;
+    assign mul_operator    = TIDE_EN ? tide_operator_q    : operator_i;
+
+    // signed_mult is only read by the single-cycle variant; keep it referenced
+    // so the fast-variant build has no unused signal.
+    logic unused_signed_mult;
+    assign unused_signed_mult = signed_mult;
+
+    typedef enum logic [2:0] {
+      MD_LATCH, ALBL, ALBH, AHBL, AHBH, MD_DONE
     } mult_fsm_e;
     mult_fsm_e mult_state_q, mult_state_d;
 
@@ -274,14 +325,125 @@ module ibex_multdiv_fast #(
     // 1. The 2 MSBs of the multiplicants are always equal, and
     // 2. The 16 MSBs of the addend (accum[33:18]) are always equal.
     // Thus, it is safe to ignore mac_res_ext[34].
-    assign mac_res_signed =
-        $signed({sign_a, mult_op_a}) * $signed({sign_b, mult_op_b}) + $signed(accum);
+    //
+    // TIDE: the multiply operands and the accumulator are additionally
+    // registered one state ahead (selected by mult_state_d), so the 17x17
+    // multipliers and the 34-bit addend start at flip-flops instead of the
+    // FSM-state decode cone.  The FSM keeps the same transitions and the same
+    // cycle count; TIDE_EN=0 keeps the upstream combinational operand muxes.
+    if (TIDE_EN) begin : gen_tide_mul_pipe
+      logic [15:0] tide_mul_a_q;
+      logic [15:0] tide_mul_b_q;
+      logic        tide_sign_a_q;
+      logic        tide_sign_b_q;
+      logic [33:0] tide_accum_q;
+
+      logic [15:0] tide_mul_a_d;
+      logic [15:0] tide_mul_b_d;
+      logic        tide_sign_a_d;
+      logic        tide_sign_b_d;
+      logic [33:0] tide_accum_d;
+
+      assign mac_res_signed =
+          $signed({tide_sign_a_q, tide_mul_a_q}) * $signed({tide_sign_b_q, tide_mul_b_q}) +
+          $signed(tide_accum_q);
+
+      // Next-state operand/accumulator selection.  mult_state_d is the state
+      // active after the next clock edge, so the registers are loaded with
+      // exactly the operands that state needs.  ALBL is entered only from
+      // MD_LATCH and is captured straight from the instruction inputs below.
+      always_comb begin
+        tide_mul_a_d  = tide_mul_a_q;
+        tide_mul_b_d  = tide_mul_b_q;
+        tide_sign_a_d = tide_sign_a_q;
+        tide_sign_b_d = tide_sign_b_q;
+        // TIDE: pure data default (no q feedback), so synthesis never sees an
+        // enable-like hold mux on the accumulator.  The next-state cases below
+        // select the partial product; the ALBL arm zeroes the accumulator when
+        // the next state is the first multiply state (current state MD_LATCH).
+        tide_accum_d  = mac_res_d;
+
+        unique case (mult_state_d)
+          ALBL: begin
+            tide_accum_d  = '0;
+          end
+          ALBH: begin
+            tide_mul_a_d  = mul_a[`OP_L];
+            tide_mul_b_d  = mul_b[`OP_H];
+            tide_sign_a_d = 1'b0;
+            tide_sign_b_d = mul_signed_mode[1] & mul_b[31];
+            tide_accum_d  = {18'b0, mac_res_d[31:16]};
+          end
+          AHBL: begin
+            tide_mul_a_d  = mul_a[`OP_H];
+            tide_mul_b_d  = mul_b[`OP_L];
+            tide_sign_a_d = mul_signed_mode[0] & mul_a[31];
+            tide_sign_b_d = 1'b0;
+            tide_accum_d  = (mul_operator == MD_OP_MULL) ? {18'b0, mac_res_d[31:16]} :
+                                                            mac_res_d;
+          end
+          AHBH: begin
+            tide_mul_a_d        = mul_a[`OP_H];
+            tide_mul_b_d        = mul_b[`OP_H];
+            tide_sign_a_d       = mul_signed_mode[0] & mul_a[31];
+            tide_sign_b_d       = mul_signed_mode[1] & mul_b[31];
+            tide_accum_d[17:0]  = mac_res_d[33:16];
+            tide_accum_d[33:18] = {16{(mul_signed_mode != 2'b00) & mac_res_d[33]}};
+          end
+          default: ;
+        endcase
+      end
+
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          tide_mul_a_q  <= '0;
+          tide_mul_b_q  <= '0;
+          tide_sign_a_q <= 1'b0;
+          tide_sign_b_q <= 1'b0;
+        end else if (mult_en_internal) begin
+          if (mult_state_q == MD_LATCH) begin
+            // MD_LATCH -> ALBL: the low halves of the instruction operands.
+            tide_mul_a_q  <= op_a_i[`OP_L];
+            tide_mul_b_q  <= op_b_i[`OP_L];
+            tide_sign_a_q <= 1'b0;
+            tide_sign_b_q <= 1'b0;
+          end else begin
+            tide_mul_a_q  <= tide_mul_a_d;
+            tide_mul_b_q  <= tide_mul_b_d;
+            tide_sign_a_q <= tide_sign_a_d;
+            tide_sign_b_q <= tide_sign_b_d;
+          end
+        end
+      end
+
+      // TIDE: the accumulator has no clock enable.  Its next value is a pure
+      // data function (zero while MD_LATCH is the current state, a formatted
+      // partial product otherwise), so there is no enable term for synthesis to
+      // fold into an ICG.  This removes the compare path from the 17x17
+      // multipliers and the 34-bit adder to a clock-gate enable pin.
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          tide_accum_q <= '0;
+        end else begin
+          tide_accum_q <= tide_accum_d;
+        end
+      end
+
+      // The upstream operand/accumulator muxes in the FSM always_comb are not
+      // read in TIDE builds; reference them so lint stays clean.
+      logic unused_tide_mul_ctrl;
+      assign unused_tide_mul_ctrl = &{1'b0, mult_op_a, mult_op_b, sign_a, sign_b, accum};
+    end else begin : gen_upstream_mul
+      assign mac_res_signed =
+          $signed({sign_a, mult_op_a}) * $signed({sign_b, mult_op_b}) + $signed(accum);
+    end
+
     assign mac_res_ext    = $unsigned(mac_res_signed);
     assign mac_res        = mac_res_ext[33:0];
 
     always_comb begin
-      mult_op_a    = op_a_i[`OP_L];
-      mult_op_b    = op_b_i[`OP_L];
+      mult_op_a    = mul_a[`OP_L];
+      mult_op_b    = mul_b[`OP_L];
       sign_a       = 1'b0;
       sign_b       = 1'b0;
       accum        = imd_val_q_i[0];
@@ -292,10 +454,15 @@ module ibex_multdiv_fast #(
 
       unique case (mult_state_q)
 
+        MD_LATCH: begin
+          // TIDE operand/control capture cycle (no multiply).
+          mult_state_d = ALBL;
+        end
+
         ALBL: begin
           // al*bl
-          mult_op_a = op_a_i[`OP_L];
-          mult_op_b = op_b_i[`OP_L];
+          mult_op_a = mul_a[`OP_L];
+          mult_op_b = mul_b[`OP_L];
           sign_a    = 1'b0;
           sign_b    = 1'b0;
           accum     = '0;
@@ -305,13 +472,13 @@ module ibex_multdiv_fast #(
 
         ALBH: begin
           // al*bh<<16
-          mult_op_a = op_a_i[`OP_L];
-          mult_op_b = op_b_i[`OP_H];
+          mult_op_a = mul_a[`OP_L];
+          mult_op_b = mul_b[`OP_H];
           sign_a    = 1'b0;
-          sign_b    = signed_mode_i[1] & op_b_i[31];
+          sign_b    = mul_signed_mode[1] & mul_b[31];
           // result of AL*BL (in imd_val_q_i[0]) always unsigned with no carry
           accum     = {18'b0, imd_val_q_i[0][31:16]};
-          if (operator_i == MD_OP_MULL) begin
+          if (mul_operator == MD_OP_MULL) begin
             mac_res_d = {2'b0, mac_res[`OP_L], imd_val_q_i[0][`OP_L]};
           end else begin
             // MD_OP_MULH
@@ -322,17 +489,23 @@ module ibex_multdiv_fast #(
 
         AHBL: begin
           // ah*bl<<16
-          mult_op_a = op_a_i[`OP_H];
-          mult_op_b = op_b_i[`OP_L];
-          sign_a    = signed_mode_i[0] & op_a_i[31];
+          mult_op_a = mul_a[`OP_H];
+          mult_op_b = mul_b[`OP_L];
+          sign_a    = mul_signed_mode[0] & mul_a[31];
           sign_b    = 1'b0;
-          if (operator_i == MD_OP_MULL) begin
+          if (mul_operator == MD_OP_MULL) begin
             accum        = {18'b0, imd_val_q_i[0][31:16]};
             mac_res_d    = {2'b0, mac_res[15:0], imd_val_q_i[0][15:0]};
-            mult_valid   = 1'b1;
+            if (TIDE_EN) begin
+              // The formatted result is captured in imd_val_q[0] at the end of
+              // this cycle; MD_DONE presents it on the next one.
+              mult_state_d = MD_DONE;
+            end else begin
+              mult_valid   = 1'b1;
+              mult_state_d = ALBL;
+            end
 
             // Note no state transition will occur if mult_hold is set
-            mult_state_d = ALBL;
             mult_hold    = ~multdiv_ready_id_i;
           end else begin
             accum        = imd_val_q_i[0];
@@ -344,29 +517,46 @@ module ibex_multdiv_fast #(
         AHBH: begin
           // only MD_OP_MULH here
           // ah*bh
-          mult_op_a = op_a_i[`OP_H];
-          mult_op_b = op_b_i[`OP_H];
-          sign_a    = signed_mode_i[0] & op_a_i[31];
-          sign_b    = signed_mode_i[1] & op_b_i[31];
-          accum[17: 0]  = imd_val_q_i[0][33:16];
-          accum[33:18]  = {16{signed_mult & imd_val_q_i[0][33]}};
+          mult_op_a     = mul_a[`OP_H];
+          mult_op_b     = mul_b[`OP_H];
+          sign_a        = mul_signed_mode[0] & mul_a[31];
+          sign_b        = mul_signed_mode[1] & mul_b[31];
           // result of AH*BL is not signed only if signed_mode_i == 2'b00
-          mac_res_d    = mac_res;
-          mult_valid   = 1'b1;
+          accum[17: 0]  = imd_val_q_i[0][33:16];
+          accum[33:18]  = {16{(mul_signed_mode != 2'b00) & imd_val_q_i[0][33]}};
+          mac_res_d     = mac_res;
+          if (TIDE_EN) begin
+            // The final high product is captured in imd_val_q[0] at the end of
+            // this cycle; MD_DONE presents it on the next one.
+            mult_state_d = MD_DONE;
+          end else begin
+            mult_valid   = 1'b1;
+            mult_state_d = ALBL;
+          end
 
           // Note no state transition will occur if mult_hold is set
-          mult_state_d = ALBL;
+          mult_hold = ~multdiv_ready_id_i;
+        end
+
+        MD_DONE: begin
+          // TIDE result-presentation cycle: the last multiply cycle wrote the
+          // formatted result into imd_val_q[0]; keep presenting it until the
+          // writeback stage is ready.
+          mac_res_d    = imd_val_q_i[0];
+          mult_valid   = 1'b1;
+          mult_state_d = MD_LATCH;
           mult_hold    = ~multdiv_ready_id_i;
         end
+
         default: begin
-          mult_state_d = ALBL;
+          mult_state_d = TIDE_EN ? MD_LATCH : ALBL;
         end
       endcase // mult_state_q
     end
 
     always_ff @(posedge clk_i or negedge rst_ni) begin
       if (!rst_ni) begin
-        mult_state_q <= ALBL;
+        mult_state_q <= TIDE_EN ? MD_LATCH : ALBL;
       end else begin
         if (mult_en_internal) begin
           mult_state_q <= mult_state_d;
@@ -374,10 +564,34 @@ module ibex_multdiv_fast #(
       end
     end
 
+    // TIDE operand/control capture.  MD_LATCH is the idle state in TIDE builds,
+    // so the multiplier always runs from these registers.
+    if (TIDE_EN) begin : gen_tide_mul_latch
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          tide_op_a_q        <= '0;
+          tide_op_b_q        <= '0;
+          tide_signed_mode_q <= '0;
+          tide_operator_q    <= MD_OP_MULL;
+        end else if (mult_en_internal && (mult_state_q == MD_LATCH)) begin
+          tide_op_a_q        <= op_a_i;
+          tide_op_b_q        <= op_b_i;
+          tide_signed_mode_q <= signed_mode_i;
+          tide_operator_q    <= operator_i;
+        end
+      end
+    end else begin : gen_no_tide_mul_latch
+      // TIDE_EN=0: operands stay combinational, upstream multiply timing holds.
+      assign tide_op_a_q        = '0;
+      assign tide_op_b_q        = '0;
+      assign tide_signed_mode_q = '0;
+      assign tide_operator_q    = MD_OP_MULL;
+    end
+
     // States must be known/valid.
     `ASSERT_KNOWN(IbexMultStateKnown, mult_state_q)
 
-    assign sva_mul_fsm_idle = mult_state_q == ALBL;
+    assign sva_mul_fsm_idle = TIDE_EN ? (mult_state_q == MD_LATCH) : (mult_state_q == ALBL);
 
   end // gen_mult_fast
 
@@ -391,6 +605,16 @@ module ibex_multdiv_fast #(
                                              {1'b0, op_quotient_q};
 
   assign one_shift      = {31'b0, 1'b1} << div_counter_q;
+
+  // TIDE: enable-free next value for the quotient register.  When
+  // div_en_internal is high this is bit-identical to op_quotient_d (clear in
+  // MD_ABS_A, set the current quotient bit in MD_COMP, hold elsewhere), but it
+  // is written as a pure data function so the register can be implemented
+  // without a clock-gate enable.  Removing the enable also removes the
+  // data-compare term synthesis adds to the ICG enable, which is the cone that
+  // violates timing through the ALU adder and is_greater_equal.
+  assign tide_quotient_d = (op_quotient_q & ~{32{md_state_q == MD_ABS_A}}) |
+                           ({32{(md_state_q == MD_COMP) & is_greater_equal}} & one_shift);
 
   // The adder in the ALU computes alu_operand_a_o + alu_operand_b_o which means
   // Remainder - Divisor. If Remainder - Divisor >= 0, is_greater_equal is equal to 1,

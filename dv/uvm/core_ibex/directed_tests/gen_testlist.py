@@ -435,6 +435,17 @@ def add_configs_and_handwritten_directed_tests():
   iterations: 1
   test_srcs: u_mode_exec_test/u_mode_exec_test.S
   config: riscv-tests
+
+- test: tide_qop_smoke
+  desc: >
+    TIDE-ISA directed smoke test: QWAIT/QSYNC/QTRIG/QLOAD decode and
+    trap paths (unanchored QWAIT, C1 mask checks, TQ_LATE), TLR/CSR
+    readback, stub-enqueued completion records via QLOAD. Cosim is
+    disabled (spike has no TIDE-ISA model).
+  iterations: 1
+  test_srcs: tide_qop_smoke/tide_qop_smoke.S
+  config: riscv-tests
+  sim_opts: +disable_cosim=1
 '''
     testlist_string += available_directed_tests
     with open('directed_testlist.yaml', "a") as f:

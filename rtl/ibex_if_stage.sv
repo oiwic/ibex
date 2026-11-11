@@ -32,7 +32,12 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   parameter lfsr_perm_t  RndCnstLfsrPerm      = RndCnstLfsrPermDefault,
   parameter bit          BranchPredictor      = 1'b0,
   parameter bit          MemECC               = 1'b0,
-  parameter int unsigned MemDataWidth         = MemECC ? 32 + 7 : 32
+  parameter int unsigned MemDataWidth         = MemECC ? 32 + 7 : 32,
+  // B1: pre-decode the TIDE opcode fields on the fetch side so they can be
+  // registered together with the instruction.  The ID stage then sees the
+  // TIDE fields without a decoder cone from the ID instruction register.
+  parameter bit          TIDE_EN              = 1'b0,
+  parameter int          NRQ                  = 16
 ) (
   input  logic                         clk_i,
   input  logic                         rst_ni,
@@ -87,6 +92,12 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   output logic                        instr_fetch_err_plus2_o,  // bus error misaligned
   output logic                        illegal_c_insn_id_o,      // compressed decoder thinks this
                                                                 // is an invalid instr
+  // Registered TIDE pre-decode (B1), valid with the instruction in ID.
+  output ibex_tide_pkg::tide_op_e     tide_op_id_o,
+  output logic [4:0]                  tide_pi_id_o,
+  output logic [11:0]                 tide_imm12_id_o,
+  output logic [4:0]                  tide_rq_idx_id_o,
+  output logic                        tide_enc_illegal_id_o,
   output logic                        instr_fetch_cheriot_acc_vio_o,
   output logic                        instr_fetch_cheriot_bound_vio_o,
   output logic                        dummy_instr_id_o,         // Instruction is a dummy
@@ -562,6 +573,66 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
     assign dummy_instr_id_o        = 1'b0;
   end
 
+  // B1: TIDE pre-decode of the instruction entering the ID register.  It is
+  // purely an encoding decode; the architectural illegal-instruction verdict
+  // is still produced by ibex_decoder in the ID stage.
+  ibex_tide_pkg::tide_op_e tide_op_pre;
+  logic [4:0]              tide_pi_pre;
+  logic [11:0]             tide_imm12_pre;
+  logic [4:0]              tide_rq_idx_pre;
+  logic                    tide_enc_illegal_pre;
+
+  always_comb begin
+    tide_op_pre          = ibex_tide_pkg::TideOpNone;
+    tide_pi_pre          = 5'd0;
+    tide_imm12_pre       = 12'd0;
+    tide_rq_idx_pre      = 5'd0;
+    tide_enc_illegal_pre = 1'b0;
+
+    if (TIDE_EN) begin
+      unique case (instr_out[6:0])
+        OPCODE_TIDE0: begin
+          unique case (instr_out[14:12])
+            3'b000: begin // QWAIT
+              tide_op_pre          = ibex_tide_pkg::TideOpQwait;
+              tide_imm12_pre       = instr_out[31:20];
+              tide_enc_illegal_pre = (instr_out[11:7] != 5'd0);
+            end
+            3'b011: begin // QSYNC
+              tide_op_pre          = ibex_tide_pkg::TideOpQsync;
+              tide_imm12_pre       = instr_out[31:20];
+              tide_enc_illegal_pre = (instr_out[11:7] != 5'd0);
+            end
+            default: tide_enc_illegal_pre = 1'b1;
+          endcase
+        end
+        OPCODE_TIDE1: begin
+          unique case (instr_out[14:12])
+            3'b000: begin // QTRIG
+              tide_op_pre          = ibex_tide_pkg::TideOpQtrig;
+              tide_pi_pre          = instr_out[29:25];
+              tide_enc_illegal_pre = (instr_out[31:30] != 2'b0) |
+                                     (instr_out[11:7] != 5'd0);
+            end
+            3'b001: begin // QLOAD
+              tide_op_pre          = ibex_tide_pkg::TideOpQload;
+              tide_rq_idx_pre      = instr_out[19:15];
+              tide_enc_illegal_pre = (instr_out[31:25] != 7'd0) |
+                                     (instr_out[24:20] != 5'd0) |
+                                     ({27'd0, instr_out[19:15]} >= NRQ);
+            end
+            default: tide_enc_illegal_pre = 1'b1;
+          endcase
+        end
+        default: tide_enc_illegal_pre = 1'b0;
+      endcase
+    end else if ((instr_out[6:0] == OPCODE_TIDE0) ||
+                 (instr_out[6:0] == OPCODE_TIDE1)) begin
+      // With TIDE_EN=0 ibex_decoder marks both TIDE opcodes illegal.
+      tide_enc_illegal_pre = 1'b1;
+    end
+  end
+
   // The ID stage becomes valid as soon as any instruction is registered in the ID stage flops.
   // Note that the current instruction is squashed by the incoming pc_set_i signal.
   // Valid is held until it is explicitly cleared (due to an instruction completing or an exception)
@@ -583,6 +654,19 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   // Signal when a new instruction enters the ID stage (only used for RVFI signalling).
   assign instr_new_id_o   = instr_new_id_q;
 
+  // B1: registered TIDE pre-decode, captured with the instruction.
+  ibex_tide_pkg::tide_op_e tide_op_id_q;
+  logic [4:0]              tide_pi_id_q;
+  logic [11:0]             tide_imm12_id_q;
+  logic [4:0]              tide_rq_idx_id_q;
+  logic                    tide_enc_illegal_id_q;
+
+  assign tide_op_id_o          = tide_op_id_q;
+  assign tide_pi_id_o          = tide_pi_id_q;
+  assign tide_imm12_id_o       = tide_imm12_id_q;
+  assign tide_rq_idx_id_o      = tide_rq_idx_id_q;
+  assign tide_enc_illegal_id_o = tide_enc_illegal_id_q;
+
   // IF-ID pipeline registers, frozen when the ID stage is stalled
   assign if_id_pipe_reg_we = instr_new_id_d;
 
@@ -599,6 +683,11 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
         instr_expanded_id_o             <= '0;
         illegal_c_insn_id_o             <= '0;
         pc_id_o                         <= '0;
+        tide_op_id_q                    <= ibex_tide_pkg::TideOpNone;
+        tide_pi_id_q                    <= '0;
+        tide_imm12_id_q                 <= '0;
+        tide_rq_idx_id_q                <= '0;
+        tide_enc_illegal_id_q           <= 1'b0;
       end else if (if_id_pipe_reg_we) begin
         instr_rdata_id_o                <= instr_out;
         // To reduce fan-out and help timing from the instr_rdata_id flops they are replicated.
@@ -611,6 +700,11 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
         instr_expanded_id_o             <= if_instr_rdata[15:0];
         illegal_c_insn_id_o             <= illegal_c_instr_out;
         pc_id_o                         <= pc_if_o;
+        tide_op_id_q                    <= tide_op_pre;
+        tide_pi_id_q                    <= tide_pi_pre;
+        tide_imm12_id_q                 <= tide_imm12_pre;
+        tide_rq_idx_id_q                <= tide_rq_idx_pre;
+        tide_enc_illegal_id_q           <= tide_enc_illegal_pre;
       end
     end
   end else begin : g_instr_rdata_nr
@@ -627,6 +721,11 @@ module ibex_if_stage import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
         instr_expanded_id_o             <= if_instr_rdata[15:0];
         illegal_c_insn_id_o             <= illegal_c_instr_out;
         pc_id_o                         <= pc_if_o;
+        tide_op_id_q                    <= tide_op_pre;
+        tide_pi_id_q                    <= tide_pi_pre;
+        tide_imm12_id_q                 <= tide_imm12_pre;
+        tide_rq_idx_id_q                <= tide_rq_idx_pre;
+        tide_enc_illegal_id_q           <= tide_enc_illegal_pre;
       end
     end
   end

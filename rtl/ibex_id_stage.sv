@@ -1,4 +1,5 @@
 // Copyright lowRISC contributors.
+  // ID/EX FSM state (declared here so the TIDE logic below can reference it).
 // Copyright 2018 ETH Zurich and University of Bologna, see also CREDITS.md.
 // Copyright Microsoft Corporation
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
@@ -27,7 +28,13 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   parameter bit               WritebackStage  = 0,
   parameter bit               BranchPredictor = 0,
   parameter bit               MemECC          = 1'b0,
-  parameter ibex_pkg::base_isa_e BaseIsa      = ibex_pkg::BaseIsaRV32IorCHERIoT
+  parameter ibex_pkg::base_isa_e BaseIsa      = ibex_pkg::BaseIsaRV32IorCHERIoT,
+  parameter bit               TIDE_EN         = 1'b0,
+  // TIDE build parameters (frozen Version A defaults; the frozen
+  // tide_cd_top surface passes them through). NCH sizes the QTRIG
+  // channel-mask legality check (C1); NRQ the QLOAD index check.
+  parameter int               NCH             = 16,
+  parameter int               NRQ             = 16
 ) (
   input  logic                      clk_i,
   input  logic                      rst_ni,
@@ -223,10 +230,39 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   input  logic                      cheriot_wb_err_i,
   input  logic [15:0]               cheriot_wb_err_info_i,
   input  logic                      cheriot_branch_req_i,   // from cheriot EX
-  input  logic [31:0]               cheriot_branch_target_i
+  input  logic [31:0]               cheriot_branch_target_i,
+
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN; see tide_doc ch09 ??-6, ch10 ??.3)
+  // CD<->DD channel interfaces
+  input  ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp_i,
+  input  ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp_i,
+  input  logic                          tide_sync_anchor_i,
+  input  logic                          tide_gc_realign_i,
+  input  logic                          tide_halt_i,
+  input  ibex_tide_pkg::tide_trap_t     tide_trap_i,
+  input  logic [31:0]                   tide_tqrty_i,
+  input  logic [31:0]                   tide_tqsyt_i,
+  // B1: TIDE fields pre-decoded in IF and registered with the instruction.
+  input  ibex_tide_pkg::tide_op_e       tide_op_id_i,
+  input  logic [4:0]                    tide_pi_id_i,
+  input  logic [11:0]                   tide_imm12_id_i,
+  input  logic [4:0]                    tide_rq_idx_id_i,
+  input  logic                          tide_enc_illegal_id_i,
+
+  output ibex_tide_pkg::tide_enq_req_t  tide_enq_req_o,
+  output ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_o,
+  output ibex_tide_pkg::tide_sync_req_t tide_sync_req_o,
+  output logic [47:0]                   tide_tlr_o,
+  output logic                          tide_anchored_o,
+  output logic                          tide_block_o,
+  output logic                          tide_csr_req_en_o,
+  output ibex_tide_pkg::tide_id_trap_t  tide_id_trap_o,
+  output ibex_tide_pkg::tide_trap_ctx_t tide_trap_ctx_o,
+  output logic                          tide_irq_ready_o
 );
 
   import ibex_pkg::*;
+  import ibex_tide_pkg::*;
 
   // Decoder/Controller, ID stage internal signals
   logic        illegal_insn_dec;
@@ -261,6 +297,9 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   logic        stall_multdiv;
   logic        stall_branch;
   logic        stall_jump;
+  logic        stall_tide;
+  logic        stall_tide_csr;
+  logic        tide_csr_hold_q;
   logic        stall_id;
   logic        stall_wb;
   logic        flush_id;
@@ -403,13 +442,36 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
         IMM_B_INCR_PC,
         IMM_B_INCR_ADDR})
   end else begin : g_nobtalu
-    op_a_sel_e  unused_a_mux_sel;
-    imm_b_sel_e unused_b_mux_sel;
+    if (TIDE_EN) begin : g_tide_btalu_muxes
+      // TIDE keeps BranchTargetALU=0 but still builds the branch/jump target
+      // with the dedicated 33-bit adder in the EX stage.  The target operand
+      // muxes therefore have to be live in this configuration as well.
+      always_comb begin : bt_operand_a_mux
+        unique case (bt_a_mux_sel)
+          OP_A_REG_A:  bt_a_operand_o = rf_rdata_a_fwd;
+          OP_A_CURRPC: bt_a_operand_o = pc_id_i;
+          default:     bt_a_operand_o = pc_id_i;
+        endcase
+      end
 
-    assign unused_a_mux_sel = bt_a_mux_sel;
-    assign unused_b_mux_sel = bt_b_mux_sel;
-    assign bt_a_operand_o   = '0;
-    assign bt_b_operand_o   = '0;
+      always_comb begin : bt_immediate_b_mux
+        unique case (bt_b_mux_sel)
+          IMM_B_I:         bt_b_operand_o = imm_i_type;
+          IMM_B_B:         bt_b_operand_o = imm_b_type;
+          IMM_B_J:         bt_b_operand_o = imm_j_type;
+          IMM_B_INCR_PC:   bt_b_operand_o = instr_is_compressed_i ? 32'h2 : 32'h4;
+          default:         bt_b_operand_o = instr_is_compressed_i ? 32'h2 : 32'h4;
+        endcase
+      end
+    end else begin : g_unused_btalu_muxes
+      op_a_sel_e  unused_a_mux_sel;
+      imm_b_sel_e unused_b_mux_sel;
+
+      assign unused_a_mux_sel = bt_a_mux_sel;
+      assign unused_b_mux_sel = bt_b_mux_sel;
+      assign bt_a_operand_o   = '0;
+      assign bt_b_operand_o   = '0;
+    end
 
     // Full main ALU immediate MUX for Operand B
     always_comb begin : immediate_b_mux
@@ -461,10 +523,16 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   assign rf_we_id_o = rf_we_raw & instr_executing & ~illegal_csr_insn_i;
 
   // Register file write data mux
+  // TIDE QLOAD writeback: the result comes from the DD readout queue
+  // head (result channel), substituted into the RF_WD_CSR datapath.
+  logic [31:0] csr_rdata_id;
+  logic          tide_qload_wb;
+  assign csr_rdata_id = (TIDE_EN & tide_qload_wb) ? tide_rq_rsp_i.result : csr_rdata_i;
+
   always_comb begin : rf_wdata_id_mux
     unique case (rf_wdata_sel)
       RF_WD_EX:  rf_wdata_id_o = result_ex_i;
-      RF_WD_CSR: rf_wdata_id_o = csr_rdata_i;
+      RF_WD_CSR: rf_wdata_id_o = csr_rdata_id;
       default:   rf_wdata_id_o = result_ex_i;
     endcase
   end
@@ -473,12 +541,28 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   // Decoder //
   /////////////
 
+  // TIDE decoded operation and operands (see decoder instance below).
+  // Declared before use: the decoder port list and the controller instance
+  // reference these nets, and this VCS (O-2018.09) has no use-before-declaration
+  // tolerance that would keep the intended widths.
+  tide_op_e      tide_op_dec;
+  logic [4:0]    tide_pi_dec;
+  logic [11:0]   tide_imm12_dec;
+  logic [4:0]    tide_rq_idx_dec;
+  logic          tide_block_dec;
+  logic          tide_done;
+  logic          tide_csr_rd_dec;
+  logic          tide_csr_wait_dec;
+  tide_id_trap_t tide_id_trap;
+
   ibex_decoder #(
     .RV32E          (RV32E),
     .RV32M          (RV32M),
     .RV32B          (RV32B),
     .BranchTargetALU(BranchTargetALU),
-    .BaseIsa        (BaseIsa)
+    .BaseIsa        (BaseIsa),
+    .TIDE_EN        (TIDE_EN),
+  .NRQ            (NRQ)
   ) decoder_i (
     .cheriot_enable_i(cheriot_enable_i),
 
@@ -565,7 +649,13 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     .cheriot_adder_a_sel_o    (cheriot_adder_a_sel_o),
     .cheriot_adder_b_sel_o    (cheriot_adder_b_sel_o),
     .cheriot_setaddr_sel_o    (cheriot_setaddr_sel_o),
-    .cheriot_setbounds_sel_o  (cheriot_setbounds_sel_o)
+    .cheriot_setbounds_sel_o  (cheriot_setbounds_sel_o),
+
+    // TIDE-ISA
+    .tide_op_o     (tide_op_dec),
+    .tide_pi_o     (tide_pi_dec),
+    .tide_imm12_o  (tide_imm12_dec),
+    .tide_rq_idx_o (tide_rq_idx_dec)
   );
 
   assign instr_is_rv32lsu_id_o = lsu_req_dec;
@@ -602,8 +692,11 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
                               // MRET must be in M-Mode. TW means trap WFI to M-Mode.
                               (mret_insn_dec | (csr_mstatus_tw_i & wfi_insn_dec));
 
+  logic          illegal_insn_tide;
   assign illegal_insn_o = instr_valid_i &
-      (illegal_insn_dec | illegal_csr_insn_i | illegal_dret_insn | illegal_umode_insn);
+
+      (illegal_insn_dec | illegal_csr_insn_i | illegal_dret_insn | illegal_umode_insn |
+       illegal_insn_tide);
 
   assign mem_resp_intg_err = lsu_load_resp_intg_err_i | lsu_store_resp_intg_err_i;
 
@@ -611,7 +704,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     .BaseIsa        (BaseIsa),
     .WritebackStage (WritebackStage),
     .BranchPredictor(BranchPredictor),
-    .MemECC(MemECC)
+    .MemECC(MemECC),
+    .TIDE_EN        (TIDE_EN)
   ) controller_i (
     .clk_i           (clk_i),
     .rst_ni          (rst_ni),
@@ -718,7 +812,15 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     .cheriot_wb_err_i        (cheriot_wb_err_i),
     .cheriot_wb_err_info_i   (cheriot_wb_err_info_i),
     .cheriot_branch_req_i    (cheriot_branch_req_i),
-    .cheriot_branch_target_i (cheriot_branch_target_i)
+    .cheriot_branch_target_i (cheriot_branch_target_i),
+
+    // TIDE-ISA
+    .tide_block_i    (tide_block_dec),
+    .tide_irq_ready_i (tide_irq_ready_o),
+    .tide_id_trap_i  (tide_id_trap),
+    .tide_trap_i     (tide_trap_i),
+    .tide_halt_i     (tide_halt_i),
+    .tide_trap_ctx_o (tide_trap_ctx_o)
   );
 
   assign multdiv_en_dec   = mult_en_dec | div_en_dec;
@@ -739,9 +841,29 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   // asserting it for an illegal csr access would result in a flush that would need to deassert it).
 
   // improve timing for CHERIoT mode (instr_id_done has too much logic)
+  // CSR accesses are neither branches/jumps/multdiv nor TIDE blocking
+  // instructions, so those stall terms are logically zero for them.  Excluding
+  // them keeps the TIDE/branch/multdiv decode cones off csr_op_en_o, which
+  // drives the CSR pipeline flush and therefore id_in_ready (B1/B2 timing).
+  //
+  // The DD-managed RO CSR hold term (stall_tide_csr) is excluded too: a legal
+  // access to those CSRs is a pure read (the decoder normalises csrrs/csrrc
+  // with rs1=x0 to CSR_OP_READ), so csr_we_int and csr_pipe_flush stay low,
+  // while the DD split-bus request has its own first-cycle pulse
+  // (tide_csr_req_en_o).  Keeping the term would route the TIDE CSR address
+  // decode (csr_addr_o -> tide_csr_rd_dec -> stall_tide_csr) into csr_op_en_o
+  // and from there into every mhpmcounter write enable and mtvec clock gate,
+  // which is the B2 clock-gating path in the ssg0p81vm40c report.
+  logic csr_instr_done;
+  assign csr_instr_done = ~(stall_ld_hz | stall_mem) &
+                          ~flush_id & instr_executing;
+
   assign csr_op_en_o = csr_access_o & instr_executing &
                        (((BaseIsa == BaseIsaRV32IorCHERIoT) & (cheriot_enable_i == IbexMuBiOn)) ?
-                        instr_first_cycle : instr_id_done_o);
+                        instr_first_cycle : csr_instr_done);
+
+  `ASSERT(CsrOpNotBlocking, csr_access_o |-> ~(tide_block_dec | branch_in_dec |
+                                              jump_in_dec | multdiv_en_dec))
 
   assign alu_operator_ex_o           = alu_operator;
   assign alu_operand_a_ex_o          = alu_operand_a;
@@ -849,18 +971,437 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     assign nt_branch_addr_o = 32'd0;
   end
 
+  ////////////////////////////
+  // TIDE-ISA (CD side)     //
+  ////////////////////////////
+  // TIDE-ISA v0.10-rc4. Landing points per tide_doc ch09 section 6.2: TLR
+  // bypass register + 49-bit adder, request generation and stall/restart
+  // for the three blocking instructions, hart-local timeout counters and
+  // the synchronous TQ_* trap source. Gated by TIDE_EN: with TIDE_EN=0
+  // every signal below is constant and the datapath is bit-identical to
+  // upstream Ibex (I1).
+  //
+  // Local (ID stage) legality checks (ISA ?3.3, ?4.1): unanchored usage of
+  // QWAIT/QTRIG/QLOAD, QWAIT phase overflow, QTRIG mask legality. These
+  // raise the standard illegal instruction exception (mcause=2, mtval=insn).
+  // The enqueue-point checks C2/C3/C4 are evaluated by the DD and reported
+  // on tide_enq_rsp (TQ_LATE / TQ_FULL / stall).
+
+  // Decoder outputs (see decoder instance)
+
+  // Signals shared with the FSM / register-file writeback path
+  assign tide_id_trap_o = tide_id_trap;
+
+  // DD-managed RO CSRs (ISA 5.1): serviced by the DD over the CSR split
+  // bus.  The DD registers the request at its input boundary and registers
+  // its response one cycle later, so the response is valid two cycles after
+  // the CD request pulse: the instruction is held in ID for two cycles
+  // (stall_tide_csr, then tide_csr_hold_q) and consumed in the following
+  // MULTI_CYCLE.
+  assign tide_csr_rd_dec = csr_addr_o inside {CSR_TQGC, CSR_TQGCH,
+                                              CSR_TQSTATE, CSR_TQRDATA,
+                                              CSR_TQSCHEMA, CSR_TQHEAD,
+                                              CSR_TQHEADH};
+
+  typedef enum logic { FIRST_CYCLE, MULTI_CYCLE } id_fsm_e;
+  id_fsm_e id_fsm_q, id_fsm_d;
+  if (TIDE_EN) begin : g_tide
+    // ---- TLR and anchor state (ch09 ?4.3) ----
+    // TLR is a per-hart bypass register: written only by QWAIT (advance)
+    // and by the anchor events (QSYNC release / P2 realignment, reset to 0).
+    // It never enters the general register file, forwarding or stalls.
+    logic [47:0] tide_tlr_q;
+    logic [47:0] tide_room_q;      // TLR_MAX - TLR (QWAIT legality, see below)
+    logic        tide_anchored_q;
+
+    // ---- Decoded operations ----
+    logic qwait_op, qtrig_op, qload_op, qsync_op;
+    assign qwait_op = instr_valid_i & (tide_op_id_i == TideOpQwait);
+    assign qtrig_op = instr_valid_i & (tide_op_id_i == TideOpQtrig);
+    assign qload_op = instr_valid_i & (tide_op_id_i == TideOpQload);
+    assign qsync_op = instr_valid_i & (tide_op_id_i == TideOpQsync);
+
+    // The ID decoder still produces the architectural TIDE decode (used by the
+    // illegal-instruction path); the DD/stall control uses the registered IF
+    // pre-decode instead (B1).
+    logic unused_tide_dec;
+    assign unused_tide_dec = ^{tide_op_dec, tide_pi_dec, tide_imm12_dec, tide_rq_idx_dec};
+
+    // ---- Operands (forwarded register file data) ----
+    logic [31:0] tide_rs1_op;
+    logic [31:0] tide_gid;
+    logic [47:0] tide_ts;
+    logic [48:0] tide_tsx;
+    assign tide_rs1_op = rf_rdata_a_fwd;
+    assign tide_gid    = tide_rs1_op + {20'b0, tide_imm12_id_i};
+    // TLR + PI never carries out of 48 bits: TLR <= TLR_MAX = 2^48 - 32 and
+    // PI <= 31, so the low 48 bits are the complete ts' (no second adder).
+    assign tide_tsx    = {1'b0, tide_tlr_q} + {44'b0, tide_pi_id_i};
+    assign tide_ts     = tide_tsx[47:0];
+
+    // ---- Local legality (ISA ?3.3, ?4.1) ----
+    // QWAIT: anchored, TLR + rs1 + imm <= 2^48 - 32 (no overflow/wrap).
+    //
+    // The check is factored through the registered slack to keep the
+    // forwarded RF read off the 49-bit adder/compare path:
+    //   room  = TLR_MAX - TLR          (flop, updated with TLR)
+    //   limit = room - imm             (computed in parallel with the RF read)
+    //   illegal iff imm > room, or limit < 2^32 && rs1 > limit
+    // This is exactly equivalent to TLR + rs1 + imm > TLR_MAX; the only
+    // RF-dependent logic left is a 32-bit unsigned compare. qwait_incr is
+    // 33 bits so rs1 + imm cannot lose its carry (rs1 32-bit, imm 12-bit).
+    logic [32:0] qwait_incr;
+    logic [47:0] qwait_sum;
+    logic [47:0] qwait_limit;
+    logic [48:0] qwait_limit_ext;
+    logic        qwait_imm_gt_room;
+    logic        qwait_illegal;
+    assign qwait_incr        = {1'b0, tide_rs1_op} + {21'b0, tide_imm12_id_i};
+    // Only the legal (<= TLR_MAX) case commits, so the 48-bit sum cannot
+    // overflow; the carry bit was never part of the architectural result.
+    assign qwait_sum         = tide_tlr_q + {15'd0, qwait_incr};
+    assign qwait_limit_ext   = {1'b0, tide_room_q} - {37'b0, tide_imm12_id_i};
+    assign qwait_imm_gt_room = qwait_limit_ext[48];
+    assign qwait_limit       = qwait_limit_ext[47:0];
+    assign qwait_illegal     = ~tide_anchored_q |
+                               qwait_imm_gt_room |
+                               ((qwait_limit[47:32] == 16'd0) &
+                                (tide_rs1_op > qwait_limit[31:0]));
+
+    // QTRIG: anchored, mask non-zero and no bits >= NCH (C1 on full width).
+    // The zero test is split per half so it shares the reductions with the
+    // out-of-range test instead of adding a separate 32-bit zero compare.
+    logic        qtrig_illegal;
+    localparam logic [31:0] TIDE_VALID_CH_MASK =
+        (NCH >= 32) ? 32'hFFFF_FFFF : ((32'd1 << NCH) - 32'd1);
+    assign qtrig_illegal = ~tide_anchored_q |
+                           ((tide_rs1_op & ~TIDE_VALID_CH_MASK) != 32'h0) |
+                           ((tide_rs1_op &  TIDE_VALID_CH_MASK) == 32'h0);
+
+    // QLOAD: anchored (j < NRQ already enforced by the decoder).
+    logic        qload_illegal;
+    assign qload_illegal = ~tide_anchored_q;
+
+    // Halted fault domain: new QTRIG/QLOAD/QSYNC -> TQ_HALTED, no block,
+    // no request (ISA ?6.3). QWAIT is not rejected (pure timeline math; it
+    // still needs an anchor, handled above).
+    logic        tide_halted_op;
+    assign tide_halted_op = (qtrig_op | qload_op | qsync_op) & tide_halt_i;
+
+    // Merge into the standard illegal instruction path (mcause=2).
+    assign illegal_insn_tide = (qwait_op & qwait_illegal) |
+                               (qtrig_op & qtrig_illegal) |
+                               (qload_op & qload_illegal);
+
+    // ---- Request generation (level held while the instruction is in ID)
+    // A request is only issued when the local checks pass, so a locally
+    // illegal instruction never reaches the DD (it is killed on the FLUSH
+    // path before any state change, ISA ?2.5 atomicity).
+    //
+    // The DD registers the enqueue request at its input boundary: the
+    // request is captured in its first cycle, the checker accepts it in the
+    // following cycle and the C1-C4 verdict is returned one cycle later.
+    // The CD therefore forces two wait cycles before sampling the response
+    // and keeps `valid` asserted until the instruction retires or is killed.
+    // A completed tq_err/illegal response is level-held by the DD until
+    // `valid` drops; abort_q withdraws it one cycle after the exception so
+    // the same request is not re-interpreted as a fresh enqueue.  This only
+    // delays QTRIG retirement by two cycles and does not change ISA semantics
+    // (the push+retire cycle is still atomic).
+    logic qtrig_active, qload_active, qsync_active;
+    logic tide_qtrig_wait_q, tide_qtrig_rsp_rdy_q, tide_qtrig_abort_q;
+    logic qtrig_go, qtrig_rsp;
+    // Encoding-illegal instructions (e.g. QLOAD with an out-of-range queue
+    // index, QTRIG/QWAIT with rd != x0) are flushed by the controller on the
+    // same cycle they decode, so they must not drive the DD or update TLR.
+    assign qtrig_active = qtrig_op & ~tide_enc_illegal_id_i & ~qtrig_illegal & ~tide_halted_op;
+    assign qload_active = qload_op & ~tide_enc_illegal_id_i & ~qload_illegal & ~tide_halted_op;
+    assign qsync_active = qsync_op & ~tide_enc_illegal_id_i & ~tide_halted_op;
+
+    assign qtrig_go  = qtrig_active & ~tide_qtrig_abort_q;
+    assign qtrig_rsp = tide_qtrig_rsp_rdy_q & ~tide_qtrig_abort_q;
+
+    assign tide_enq_req_o  = '{
+      valid    : qtrig_go,
+      mask     : tide_rs1_op,
+      code     : rf_rdata_b_fwd,
+      pi       : tide_pi_id_i,
+      ts_prime : tide_tsx,
+      pc       : pc_id_i
+    };
+    assign tide_rq_pop_o   = '{valid: qload_active, rq_idx: tide_rq_idx_id_i};
+    assign tide_sync_req_o = '{valid: qsync_active, gid: tide_gid};
+
+    // ---- Done (retire) and block predicates (ISA ?2.5) ----
+    // State change and retire are the same cycle (atomic retire). The
+    // block predicate is stateless: kill-and-re-execute == keep waiting.
+    // The first cycle (accept cycle) always blocks; the verdict is sampled
+    // only in the following response cycle.
+    logic tide_qtrig_done, tide_qload_done, tide_qsync_done;
+    assign tide_qtrig_done = qtrig_go & qtrig_rsp &
+                             ~tide_enq_rsp_i.stall &
+                             ~tide_enq_rsp_i.illegal & ~tide_enq_rsp_i.tq_err;
+    assign tide_qload_done = qload_active & tide_rq_rsp_i.valid;
+    assign tide_qsync_done = qsync_active & tide_sync_anchor_i;
+    assign tide_done       = tide_qtrig_done | tide_qload_done | tide_qsync_done;
+
+    assign tide_block_dec = (qtrig_active & (tide_qtrig_abort_q |
+                                             ~tide_qtrig_rsp_rdy_q |
+                                             tide_enq_rsp_i.stall |
+                                             tide_enq_rsp_i.illegal |
+                                             tide_enq_rsp_i.tq_err)) |
+                            (qload_active & ~tide_rq_rsp_i.valid) |
+                            (qsync_active & ~tide_sync_anchor_i);
+
+    // ---- DD-managed RO CSR read (ch09 5.1 / 6.2) ----
+    // First cycle: pulse the split-bus read request. The instruction is
+    // held two cycles (stall_tide_csr, then tide_csr_hold_q) while the DD
+    // input boundary captures the request and the DD response register is
+    // loaded, then completes in the following MULTI_CYCLE: the DD response
+    // drives csr_rdata_i, csr_op_en_o pulses exactly once and the register
+    // file takes the response. Only the architectural result is fixed
+    // (ISA 5.1); the extra cycles are not visible to software.
+    assign tide_csr_wait_dec = csr_access_o & instr_executing &
+                               ~illegal_insn_o & tide_csr_rd_dec &
+                               (id_fsm_q == FIRST_CYCLE);
+    assign tide_csr_req_en_o = tide_csr_wait_dec;
+
+    // QTRIG request/response phase and abort state. Cleared on reset, when
+    // the instruction leaves ID (flush/kill), and on retire so the next
+    // QTRIG (possibly the very next instruction) starts a fresh transaction.
+    // wait_q marks the enqueue-accept cycle, rsp_rdy_q the verdict cycle.
+    always_ff @(posedge clk_i or negedge rst_ni) begin : tide_qtrig_rsp_reg
+      if (!rst_ni) begin
+        tide_qtrig_wait_q    <= 1'b0;
+        tide_qtrig_rsp_rdy_q <= 1'b0;
+        tide_qtrig_abort_q   <= 1'b0;
+      end else if (!qtrig_active || tide_qtrig_done) begin
+        tide_qtrig_wait_q    <= 1'b0;
+        tide_qtrig_rsp_rdy_q <= 1'b0;
+        tide_qtrig_abort_q   <= 1'b0;
+      end else begin
+        tide_qtrig_wait_q    <= 1'b1;
+        tide_qtrig_rsp_rdy_q <= tide_qtrig_wait_q;
+        if (tide_qtrig_rsp_rdy_q &&
+            (tide_enq_rsp_i.tq_err | tide_enq_rsp_i.illegal)) begin
+          tide_qtrig_abort_q <= 1'b1;
+        end
+      end
+    end
+
+    // ---- QWAIT: single-cycle TLR advance (ISA ?4.1) ----
+    logic        qwait_commit;
+    logic [47:0] qwait_room_next;
+    assign qwait_commit = qwait_op & ~tide_enc_illegal_id_i & ~qwait_illegal &
+                          instr_executing & (id_fsm_q == FIRST_CYCLE);
+    // On commit imm <= room and rs1 <= limit, so this is the exact
+    // TLR_MAX - (TLR + rs1 + imm) slack for the next instruction.  It reuses
+    // the 33-bit rs1+imm adder instead of a second serial subtractor.
+    assign qwait_room_next = tide_room_q - {15'd0, qwait_incr};
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : tide_tlr_reg
+      if (!rst_ni) begin
+        tide_tlr_q      <= 48'h0;
+        tide_room_q     <= TLR_MAX[47:0];
+        tide_anchored_q <= 1'b0;
+      end else begin
+        // P2 global realignment (DD->CD pulse): GC<-0, queued events gone,
+        // timeline restarts. QSYNC release: re-anchor. Both clear TLR; only
+        // the release sets anchored. (The DD guarantees an anchor pulse only
+        // for this hart's QSYNC release; realignment wins if it coincides
+        // with an in-flight QWAIT.)
+        if (tide_gc_realign_i) begin
+          tide_tlr_q      <= 48'h0;
+          tide_room_q     <= TLR_MAX[47:0];
+          tide_anchored_q <= 1'b0;
+        end else if (tide_sync_anchor_i) begin
+          tide_tlr_q      <= 48'h0;
+          tide_room_q     <= TLR_MAX[47:0];
+          tide_anchored_q <= 1'b1;
+        end else if (qwait_commit) begin
+          tide_tlr_q  <= qwait_sum;
+          tide_room_q <= qwait_room_next;
+        end
+      end
+    end
+
+    // ---- QLOAD writeback flag (see rf_wdata_id_mux) ----
+    assign tide_qload_wb = tide_qload_done;
+    // ---- Hart-local timeout counters (ISA ?5.4) ----
+    // One cumulative wall-tick counter for the blocked instruction,
+    // identified by PC: the count holds across interrupt/flush of the same
+    // blocked instruction (mret re-execution accumulates, ISA ?2.5
+    // equivalence) and restarts when a different instruction blocks or the
+    // block is released by normal completion. Measured in dispatch-clock
+    // ticks (same clock domain as DD GC, ch09 ?5.2).
+    logic        tide_block_q;
+    logic        tmo_valid_q;
+    logic [31:0] tmo_cnt_q;
+    logic [31:0] tmo_pc_q;
+
+    logic block_start;
+    assign block_start = tide_block_dec & ~tide_block_q;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin : tide_tmo_cnt_reg
+      if (!rst_ni) begin
+        tmo_valid_q  <= 1'b0;
+        tmo_cnt_q    <= 32'd0;
+        tmo_pc_q     <= 32'h0;
+        tide_block_q <= 1'b0;
+      end else begin
+        tide_block_q <= tide_block_dec;
+        if (tide_block_dec) begin
+          if (block_start) begin
+            if (tmo_valid_q & (tmo_pc_q == pc_id_i)) begin
+              // same blocked instruction after interrupt/flush: continue
+              tmo_cnt_q <= tmo_cnt_q + 32'd1;
+            end else begin
+              tmo_valid_q <= 1'b1;
+              tmo_pc_q    <= pc_id_i;
+              tmo_cnt_q   <= 32'd1;
+            end
+          end else begin
+            tmo_cnt_q <= (tmo_cnt_q == 32'hFFFF_FFFF) ? 32'hFFFF_FFFF :
+                         tmo_cnt_q + 32'd1;
+          end
+        end else if (tide_block_q & tide_done) begin
+          // block released by normal completion: restart the count
+          tmo_valid_q <= 1'b0;
+        end
+        // on flush (interrupt / trap kill) the count is deliberately held
+      end
+    end
+
+    // Block duration exceeds the threshold ("blocking exceeds tqrty/tqsyt").
+    // At the start of block cycle N the counter holds N-1, so cnt >= thr
+    // fires on cycle thr+1, i.e. after thr full ticks of waiting.
+    // 0 = disabled (debug only, ISA ?5.2).
+    logic tmo_rdy, tmo_sync;
+    assign tmo_rdy  = qload_active & tmo_valid_q & (tide_tqrty_i != 32'd0) &
+                      (tmo_cnt_q >= tide_tqrty_i);
+    assign tmo_sync = qsync_active & tmo_valid_q & (tide_tqsyt_i != 32'd0) &
+                      (tmo_cnt_q >= tide_tqsyt_i);
+
+    // ---- Synchronous TQ_* trap from the ID stage (class 0) ----
+    // Sources: enqueue-point TQ_LATE / TQ_FULL (non-blocking) reported by
+    // the DD on the rsp, local timeouts, TQ_HALTED. Priority (fixed,
+    // mutually exclusive in practice): enqueue error > timeout > halted.
+    logic enq_tq_err;
+    assign enq_tq_err = qtrig_go & qtrig_rsp & tide_enq_rsp_i.tq_err;
+
+    // The DD withdraws its error response as soon as abort_q drops `valid`
+    // (next cycle), but the controller samples the trap context in the
+    // FLUSH cycle after that.  Latch the payload so the CSR snapshot keeps
+    // the reported cause/channel instead of falling through to TQ_HALTED.
+    tide_tqcause_e enq_err_cause_q;
+    logic [4:0]    enq_err_ch_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin : tide_enq_err_ctx_reg
+      if (!rst_ni) begin
+        enq_err_cause_q <= TideTqCauseLate;
+        enq_err_ch_q    <= 5'd0;
+      end else if (enq_tq_err) begin
+        enq_err_cause_q <= tide_enq_rsp_i.tqcause;
+        enq_err_ch_q    <= tide_enq_rsp_i.ch;
+      end
+    end
+
+    assign tide_id_trap = '{
+      valid           : enq_tq_err | tmo_rdy | tmo_sync | tide_halted_op,
+      tqcause         : enq_tq_err         ? tide_enq_rsp_i.tqcause :
+                        tide_qtrig_abort_q ? enq_err_cause_q         :
+                        tmo_rdy    ? TideTqCauseRdyTimeout    :
+                        tmo_sync   ? TideTqCauseSyncTimeout   :
+                                     TideTqCauseHalted,
+      target_is_queue : (enq_tq_err | tide_qtrig_abort_q) ? 1'b0 : 1'b1,
+      target_idx      : enq_tq_err         ? tide_enq_rsp_i.ch :
+                        tide_qtrig_abort_q ? enq_err_ch_q       :
+                        tmo_rdy    ? tide_rq_idx_id_i  :
+                        tmo_sync   ? 5'(tide_gid)       :
+                                     5'd0,
+      ts              : (enq_tq_err | tide_qtrig_abort_q) ? tide_ts : 48'd0,
+      gid             : tmo_sync ? tide_gid : 32'd0
+    };
+
+    // ---- Outputs ----
+    assign tide_tlr_o      = tide_tlr_q;
+    assign tide_anchored_o = tide_anchored_q;
+    assign tide_block_o    = tide_block_dec;
+    // Controller handshake (ch09 section 6.3 / section 10): an interrupt, debug
+    // request or async TIDE trap may be taken while a TIDE instruction is blocked
+    // in ID only when the rest of the pipeline is empty (no non-TIDE stall,
+    // writeback ready). mepc/dpc then point at the blocked instruction, which
+    // is flushed and re-executed after mret/dret (ISA section 2.5).
+    assign tide_irq_ready_o = tide_block_dec & ~(stall_id & ~stall_tide) &
+                              ~stall_wb & ready_wb_i;
+
+  end else begin : g_no_tide
+    assign illegal_insn_tide = 1'b0;
+    assign tide_block_dec    = 1'b0;
+    assign tide_done         = 1'b0;
+    assign tide_qload_wb     = 1'b0;
+    assign tide_csr_wait_dec = 1'b0;
+    assign tide_csr_req_en_o = 1'b0;
+
+    assign tide_enq_req_o  = '{valid: 1'b0, mask: '0, code: '0, pi: '0,
+                               ts_prime: '0, pc: '0};
+    assign tide_rq_pop_o   = '{valid: 1'b0, rq_idx: '0};
+    assign tide_sync_req_o = '{valid: 1'b0, gid: '0};
+    assign tide_tlr_o      = 48'h0;
+    assign tide_anchored_o = 1'b0;
+    assign tide_block_o    = 1'b0;
+    assign tide_irq_ready_o = 1'b0;
+    assign tide_id_trap    = '{valid: 1'b0, tqcause: TideTqCauseLate,
+                               target_is_queue: 1'b0, target_idx: '0,
+                               ts: '0, gid: '0};
+
+    // Keep the TIDE signals live when the feature is compiled out so
+    // lint builds of the upstream-compatible configuration do not
+    // fail on otherwise intentional tie-offs.
+    logic unused_tide_inputs;
+    assign unused_tide_inputs = ^{
+      tide_enq_rsp_i, tide_rq_rsp_i, tide_sync_anchor_i, tide_gc_realign_i,
+      tide_tqrty_i, tide_tqsyt_i, tide_op_dec, tide_pi_dec,
+      tide_imm12_dec, tide_rq_idx_dec, tide_csr_rd_dec,
+      tide_op_id_i, tide_pi_id_i, tide_imm12_id_i, tide_rq_idx_id_i,
+      tide_enc_illegal_id_i
+    };
+
+    // decoder outputs stay at their TIDE_EN=0 constants (decoder-side
+    // defaults: TideOpNone / 0)
+  end
   ///////////////
   // ID-EX FSM //
   ///////////////
 
-  typedef enum logic { FIRST_CYCLE, MULTI_CYCLE } id_fsm_e;
-  id_fsm_e id_fsm_q, id_fsm_d;
+  // Second ID hold cycle for DD-managed RO CSR reads.  The DD input boundary
+  // registers the request, so the split-bus response lands one cycle after
+  // the response register the old one-cycle protocol assumed.  Declared at
+  // module scope so the common MULTI_CYCLE logic can consume it; tied to 0
+  // when TIDE is compiled out so the upstream FSM is unchanged.
+  generate
+    if (TIDE_EN) begin : g_tide_csr_hold
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          tide_csr_hold_q <= 1'b0;
+        end else begin
+          tide_csr_hold_q <= tide_csr_wait_dec;
+        end
+      end
+    end else begin : g_no_tide_csr_hold
+      assign tide_csr_hold_q = 1'b0;
+    end
+  endgenerate
 
   always_ff @(posedge clk_i or negedge rst_ni) begin : id_pipeline_reg
     if (!rst_ni) begin
       id_fsm_q <= FIRST_CYCLE;
     end else if (instr_executing) begin
       id_fsm_q <= id_fsm_d;
+    end else if (TIDE_EN && flush_id) begin
+      // A synchronous TIDE enqueue error can abort the instruction after it
+      // has entered MULTI_CYCLE.  A flush removes it from ID; reset the FSM so
+      // the next accepted instruction starts in FIRST_CYCLE.
+      id_fsm_q <= FIRST_CYCLE;
     end
   end
 
@@ -875,6 +1416,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     stall_multdiv           = 1'b0;
     stall_jump              = 1'b0;
     stall_branch            = 1'b0;
+    stall_tide              = 1'b0;
+    stall_tide_csr          = 1'b0;
     branch_set_raw_d        = 1'b0;
     branch_not_set          = 1'b0;
     jump_set_raw            = 1'b0;
@@ -916,9 +1459,16 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
               // All branches take two cycles in fixed time execution mode, regardless of branch
               // condition.
               // SEC_CM: CORE.DATA_REG_SW.SCA
-              id_fsm_d         = (data_ind_timing_i || (!BranchTargetALU && branch_decision_i)) ?
+              // TIDE takes two cycles for every conditional branch (taken or
+              // not) so branch_decision_i no longer feeds stall_id/id_in_ready
+              // in the first cycle.  The decision is still flopped via
+              // branch_set_raw_d and consumed in the second cycle, where the
+              // dedicated target adder supplies the branch target.
+              id_fsm_d         = (TIDE_EN || data_ind_timing_i ||
+                                  (!BranchTargetALU && branch_decision_i)) ?
                                      MULTI_CYCLE : FIRST_CYCLE;
-              stall_branch     = (~BranchTargetALU & branch_decision_i) | data_ind_timing_i;
+              stall_branch     = TIDE_EN | (~BranchTargetALU & branch_decision_i) |
+                                 data_ind_timing_i;
               branch_set_raw_d = (branch_decision_i | data_ind_timing_i);
 
               if (BranchPredictor) begin
@@ -934,6 +1484,25 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
               stall_jump    = ~BranchTargetALU;
               jump_set_raw  = jump_set_dec;
             end
+            tide_block_dec: begin
+              // TIDE blocking instruction (QTRIG backpressure, QLOAD empty
+              // FIFO, QSYNC join, or a pending TIDE error): hold in ID until
+              // the predicate clears or the controller flushes (ISA ??.5).
+              id_fsm_d   = MULTI_CYCLE;
+              stall_tide = 1'b1;
+              rf_we_raw  = rf_we_dec & ~tide_block_dec;
+            end
+            tide_csr_wait_dec: begin
+              // DD-managed RO CSR read: the split-bus request was pulsed
+              // this cycle; the DD captures it at its input boundary and
+              // registers its response one cycle later.  Hold ID for two
+              // cycles for the registered DD response.  MULTI_CYCLE then
+              // completes the CSR access with the response already in
+              // csr_rdata_i.
+              id_fsm_d       = MULTI_CYCLE;
+              stall_tide_csr = 1'b1;
+              rf_we_raw      = rf_we_dec & ~tide_csr_wait_dec;
+            end
             default: begin
               id_fsm_d      = FIRST_CYCLE;
             end
@@ -943,14 +1512,19 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
         MULTI_CYCLE: begin
           if(multdiv_en_dec) begin
             rf_we_raw       = rf_we_dec & ex_valid_i;
+          end else if (tide_block_dec) begin
+            // QLOAD register write fires exactly on the done cycle
+            rf_we_raw       = rf_we_dec & (multicycle_done & ready_wb_i);
           end
 
-          if (multicycle_done & ready_wb_i) begin
+          if (multicycle_done & ready_wb_i & ~tide_csr_hold_q) begin
             id_fsm_d        = FIRST_CYCLE;
           end else begin
             stall_multdiv   = multdiv_en_dec;
             stall_branch    = branch_in_dec;
             stall_jump      = jump_in_dec;
+            stall_tide      = tide_block_dec;
+            stall_tide_csr  = tide_csr_hold_q;
           end
         end
 
@@ -969,7 +1543,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
 
   // Stall ID/EX stage for reason that relates to instruction in ID/EX, update assertion below if
   // modifying this.
-  assign stall_id = stall_ld_hz | stall_mem | stall_multdiv | stall_jump | stall_branch;
+  assign stall_id = stall_ld_hz | stall_mem | stall_multdiv | stall_jump | stall_branch |
+                    stall_tide | stall_tide_csr;
 
   // Generally illegal instructions have no reason to stall, however they must still stall waiting
   // for outstanding memory requests so exceptions related to them take priority over the illegal
@@ -998,7 +1573,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
 
     logic instr_kill;
 
-    assign multicycle_done = (lsu_req_dec | cheriot_lsu_req_dec) ? ~stall_mem : ex_valid_all;
+    assign multicycle_done = (lsu_req_dec | cheriot_lsu_req_dec) ? ~stall_mem :
+                             (tide_block_dec ? tide_done : ex_valid_all);
 
     // Is a memory access ongoing that isn't finishing this cycle
     assign outstanding_memory_access = (outstanding_load_wb_i | outstanding_store_wb_i) &
@@ -1130,7 +1706,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     assign expecting_store_resp_o = 1'b0;
   end else begin : gen_no_stall_mem
 
-    assign multicycle_done = (cheriot_lsu_req_dec | lsu_req_dec) ? lsu_resp_valid_i : ex_valid_all;
+    assign multicycle_done = (cheriot_lsu_req_dec | lsu_req_dec) ? lsu_resp_valid_i :
+                           (tide_block_dec ? tide_done : ex_valid_all);
 
     assign data_req_allowed = instr_first_cycle;
 

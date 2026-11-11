@@ -10,6 +10,7 @@ filesets:
     files:
       - rtl/ibex_pkg.sv
       - rtl/ibex_cheriot_pkg.sv
+      - rtl/ibex_tide_pkg.sv
     file_type: systemVerilogSource
 
 targets:

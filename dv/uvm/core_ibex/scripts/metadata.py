@@ -129,7 +129,10 @@ class RegressionMetadata(scripts_lib.testdata_cls):
 
         self.pickle_file                 = self.dir_metadata/'metadata.pickle'
         self.yaml_file                   = self.dir_metadata/'metadata.yaml'
-        self.ibex_configs                = self.ibex_root/'ibex_configs.yaml'
+        cfg_file = os.environ.get('IBEX_CONFIG_FILE', 'ibex_configs.yaml')
+        self.ibex_configs = pathlib.Path(cfg_file)
+        if not self.ibex_configs.is_absolute():
+            self.ibex_configs = self.ibex_root / self.ibex_configs
         self.ot_xcelium_cov_scripts      = self.ot_lowrisc_ip/'dv'/'tools'/'xcelium'
         self.ibex_riscvdv_simulator_yaml = self.ibex_dv_root/'yaml'/'rtl_simulation.yaml'
         self.ibex_riscvdv_customtarget   = self.ibex_dv_root/'riscv_dv_extension'
