@@ -86,22 +86,15 @@ module ibex_ex_block #(
   // branch handling
   assign branch_decision_o  = alu_cmp_result;
 
-  if (BranchTargetALU) begin : g_branch_target_alu
+  // TIDE keeps BranchTargetALU=0 but builds branch/jump targets with this
+  // dedicated 33-bit adder instead of the main ALU adder, shortening the
+  // PC-redirect cone without changing the two-cycle branch structure.
+  if (BranchTargetALU | TIDE_EN) begin : g_branch_target_alu
     logic [32:0] bt_alu_result;
     logic        unused_bt_carry;
 
     assign bt_alu_result   = bt_a_operand_i + bt_b_operand_i;
 
-    assign unused_bt_carry = bt_alu_result[32];
-    assign branch_target_o = bt_alu_result[31:0];
-  end else if (TIDE_EN) begin : g_tide_branch_target_alu
-    // TIDE keeps BranchTargetALU=0 but builds branch/jump targets with this
-    // dedicated 33-bit adder instead of the main ALU adder, shortening the
-    // PC-redirect cone without changing the two-cycle branch structure.
-    logic [32:0] bt_alu_result;
-    logic        unused_bt_carry;
-
-    assign bt_alu_result   = bt_a_operand_i + bt_b_operand_i;
     assign unused_bt_carry = bt_alu_result[32];
     assign branch_target_o = bt_alu_result[31:0];
   end else begin : g_no_branch_target_alu

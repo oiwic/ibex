@@ -152,11 +152,15 @@ module ibex_multdiv_fast #(
   assign unused_mac_res_ext = mac_res_ext[34];
 
   assign signed_mult      = (signed_mode_i != 2'b00);
-  // TIDE: a multiply result is always presented from imd_val_q[0] (the only
-  // cycle in which mult_valid is asserted is MD_DONE, which holds the final
-  // result there).  TIDE_EN is a constant, so the mac_res_d arm is pruned in
-  // TIDE builds and the multiplier cone no longer reaches the RF write port.
-  assign multdiv_result_o = (div_sel_i | TIDE_EN) ? imd_val_q_i[0][31:0] : mac_res_d[31:0];
+  // TIDE: with RV32MFast a multiply result is always presented from imd_val_q[0]
+  // (the only cycle in which mult_valid is asserted is MD_DONE, which holds the
+  // final result there).  TIDE_EN is a constant, so the mac_res_d arm is pruned
+  // in TIDE builds and the multiplier cone no longer reaches the RF write port.
+  // The registered multiply pipeline only exists in gen_mult_fast, so keep the
+  // upstream combinational result path for the other multipliers; enabling TIDE
+  // on them must not silently return a stale imd_val_q[0].
+  assign multdiv_result_o = (div_sel_i | (TIDE_EN && (RV32M == RV32MFast))) ?
+                            imd_val_q_i[0][31:0] : mac_res_d[31:0];
 
   // The single cycle multiplier uses three 17 bit multipliers to compute MUL instructions in a
   // single cycle and MULH instructions in two cycles.

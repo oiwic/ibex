@@ -712,6 +712,24 @@ fusesoc --cores-root . run --target=lint --tool=verilator lowrisc:ibex:ibex_top_
 **搜索模式**：`gen_tide_mul_pipe`、`tide_mul_a_d`、`tide_accum_d`、`unused_tide_mul_ctrl`。
 **怎么验证**：MUL/MULH/MULHSU/MULHU 定向向量 + 32/16 深依赖链（`MUL_TEST_PASS`，457 instructions，1196 cycles，与 D31 一致）；`TIDE_EN=0` hello_test 13268 cycles / 261 instructions、输出逐行一致；UVM `tide_qop_smoke` + Spike 98 instructions、0 UVM_ERROR/FATAL；Verilator + Verible lint exit 0。
 
+## F30 `csr_op_en` 在 `WritebackStage=1` 时必须保留 `ready_wb_i`（D34 修正 D30/F24）
+
+**现象**：D30/F24 把 `csr_op_en_o` 的完成条件从上游 `instr_id_done` 换成 `csr_instr_done`，但丢了上游 `instr_id_done_o = en_wb_o & ready_wb_i`（`WritebackStage=1` 分支）里的 `ready_wb_i`。`WritebackStage=0` 时 `ready_wb_i` 恒 1（TIDE 版本 A 的 `small` 配置正是如此），差异被掩盖；而 8 个命名配置里 7 个是 `WritebackStage=1`（含 `opentitan`），且 `stall_wb = en_wb_o & ~ready_wb_i` 不在 `stall_id` 归约里——WB 忙时 `csr_op_en_o` 会每拍重复脉冲。
+**后果**：CSR 写、mhpmcounter 计数、`csr_pipe_flush`、`dummy_instr_seed_en` 重复生效；`TIDE_EN=0` 的 `WritebackStage=1` 构建与上游逐拍不等价（违反不变量 I1）。
+**硬规则**：① 拆分/替换上游 `instr_id_done_o` 时必须逐项复刻其因子（`en_wb_o`、`ready_wb_i`）；② 修正按运行时参数条件化——`csr_instr_done & (WritebackStage ? ready_wb_i : 1'b1)`，不能假定 `small` 的 WB=0；③ 对 CSR 指令 `csr_instr_done == instr_done`（branch/jump/multdiv/TIDE 等待项逻辑为 0），故该式在 WB=0 与 WB=1 下都与上游一致；④ 改 `csr_op_en_o` 谓词后必须在 `WritebackStage=1` 配置上复跑 lint/回归。
+**证据**：`rtl/ibex_id_stage.sv:853-866`（`csr_instr_done` 与 `csr_op_en_o`）、`:1691`/`:1769`（`instr_id_done_o` 两分支）、`:1694`（`stall_wb`）、`:1333`（`id_in_ready` 用 `~stall_wb & ready_wb_i`）；上游 `96a34a56:rtl/ibex_id_stage.sv:1119`（`instr_id_done_o = en_wb_o & ready_wb_i`）、`:1122`（`stall_wb`）、`:1196`（WB=0 分支 `instr_id_done_o = instr_done`）、`:742`（上游 `csr_op_en_o`）。
+**搜索模式**：`csr_instr_done`、`ready_wb_i`、`instr_id_done_o`、`WritebackStage ? ready_wb_i`。
+**怎么验证**：Verilator + Verible lint `lowrisc:ibex:ibex_top_tracing` 的 `small`（WB=0）与 `opentitan`（WB=1、SecureIbex=1、CHERIoT BaseIsa）均 exit 0；`TIDE_EN=0` simple system `hello_test` 13268 cycles / 261 instructions、输出逐行一致；WB=1 的写脉冲行为建议用 `make build-csr-test && make run-csr-test`（`dv/cs_registers/`，本条目落笔时未跑）。
+
+## F31 `TIDE_EN` 乘法结果 mux 只适用于 `RV32MFast`
+
+**现象**：`multdiv_result_o = (div_sel_i | TIDE_EN) ? imd_val_q_i[0] : mac_res_d` 写在 `RV32M` generate 之外，但 `MD_LATCH`/`MD_DONE` 流水线只在 `gen_mult_fast`（`RV32MFast`）内存在。`RV32MSingleCycle` 下 `mult_valid` 仍在 `mac_res_d` 有效的同一拍拉高，而 `imd_val_q[0]` 要到该拍结束才更新——`TIDE_EN=1` 的组合会取到上一拍的陈旧值。
+**后果**：`TIDE_EN=1` + `RV32MSingleCycle`（`opentitan` 配置的 `RV32M`）乘法结果错误；版本 A 固定 `RV32MFast` 的 `small` 构建不受影响，常规 TIDE 回归因此掩盖了该组合。
+**硬规则**：结果选择条件必须与流水线存在的 generate 域一致——`TIDE_EN && (RV32M == RV32MFast)`，不要写成裸 `TIDE_EN`；`RV32MSlow` 走独立模块（无 `TIDE_EN` 参数），不受影响。
+**证据**：`rtl/ibex_multdiv_fast.sv:155-163`（结果 mux）、`:167`（`gen_mult_single_cycle`）、`:292`（`gen_mult_fast` 边界）、`:545-553`（`MD_DONE` 呈现）、`:503-510`/`:532-539`（TIDE 把 `mult_valid` 推迟到 `MD_DONE`）；`ibex_configs.yaml`（`opentitan` 的 `RV32M: RV32MSingleCycle`）。
+**搜索模式**：`multdiv_result_o`、`RV32M == RV32MFast`、`gen_mult_single_cycle`、`MD_DONE`。
+**怎么验证**：Verilator + Verible lint `ibex_simple_system`（`TIDE_EN_SYS=1`）与 `ibex_top_tracing` 的 `small`/`opentitan` 均 RC=0；直接验证需构造 `TIDE_EN=1` + `RV32MSingleCycle` 的 MUL 定向测试并与 Spike 比对（当前配置矩阵未覆盖）。
+
 ## 汇总：改代码前先扫一眼这张表
 
 | # | 陷阱 | 一句话 | 严重度 |
@@ -745,6 +763,8 @@ fusesoc --cores-root . run --target=lint --tool=verilator lowrisc:ibex:ibex_top_
 | F27 | 乘法操作数/累加器提前一拍寄存（D32 细化 D31） | 按 `mult_state_d` 选好下一拍操作数；状态译码不入乘法锥；拍数不变 | ★★★ |
 | F28 | TIDE 构建条件分支固定两拍（D33/P0） | `stall_branch=1`、`id_fsm_d=MULTI_CYCLE` 把 `branch_decision` 移出第一拍 `stall_id`/`id_in_ready` 锥；目标走 TIDE 专用 33 位加法器；未跳转分支 +1 拍 | ★★★ |
 | F29 | 乘法累加器/除法商用无使能寄存器（D33/P4a/P4b） | 违例终点是 ICG EN（ECE 的 D≠Q），不是 flop D；恒写纯数据次态去掉 ICG；MUL 5 / MULH 6 / DIV 拍数不变。**前提 `WritebackStage=0`（I3）：`multdiv_ready_id_i` 恒 1，乘法/除法 FSM 不 hold；若未来打开 WB 级，须重新评估 hold 拍无使能寄存器的行为** | ★★★ |
+| F30 | `csr_op_en` 在 `WritebackStage=1` 丢了 `ready_wb_i`（D34 修正 D30/F24） | 拆分 `instr_id_done` 必须复刻 `ready_wb_i`；WB 忙时不得重复脉冲，`TIDE_EN=0` 须逐拍回归 | ★★★ |
+| F31 | `TIDE_EN` 乘法结果 mux 只适用于 `RV32MFast`（D35 修正 D31/D32 适用域） | 裸 `TIDE_EN` 会在 `RV32MSingleCycle` 下取陈旧 `imd_val_q[0]`；条件须与流水线 generate 域一致 | ★★ |
 
 ### 新增本文条目的模板
 

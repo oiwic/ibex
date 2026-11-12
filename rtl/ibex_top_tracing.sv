@@ -7,7 +7,7 @@
  * Top level module of the ibex RISC-V core with tracing enabled
  */
 
-module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide_pkg::*; #(
+module ibex_top_tracing import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   parameter base_isa_e   BaseIsa                   = BaseIsaRV32I,
   parameter bit          PMPEnable                 = 1'b0,
   parameter int unsigned PMPGranularity            = 0,

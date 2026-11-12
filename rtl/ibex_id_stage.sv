@@ -1,5 +1,4 @@
 // Copyright lowRISC contributors.
-  // ID/EX FSM state (declared here so the TIDE logic below can reference it).
 // Copyright 2018 ETH Zurich and University of Bologna, see also CREDITS.md.
 // Copyright Microsoft Corporation
 // Licensed under the Apache License, Version 2.0, see LICENSE for details.
@@ -232,7 +231,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   input  logic                      cheriot_branch_req_i,   // from cheriot EX
   input  logic [31:0]               cheriot_branch_target_i,
 
-  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN; see tide_doc ch09 ??-6, ch10 ??.3)
+  // TIDE-ISA v0.10-rc4 (gated by TIDE_EN; see tide_doc ch09 sections 4-6, ch10 section 3.3)
   // CD<->DD channel interfaces
   input  ibex_tide_pkg::tide_enq_rsp_t  tide_enq_rsp_i,
   input  ibex_tide_pkg::tide_rq_rsp_t   tide_rq_rsp_i,
@@ -253,12 +252,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   output ibex_tide_pkg::tide_rq_req_t   tide_rq_pop_o,
   output ibex_tide_pkg::tide_sync_req_t tide_sync_req_o,
   output logic [47:0]                   tide_tlr_o,
-  output logic                          tide_anchored_o,
-  output logic                          tide_block_o,
   output logic                          tide_csr_req_en_o,
-  output ibex_tide_pkg::tide_id_trap_t  tide_id_trap_o,
-  output ibex_tide_pkg::tide_trap_ctx_t tide_trap_ctx_o,
-  output logic                          tide_irq_ready_o
+  output ibex_tide_pkg::tide_trap_ctx_t tide_trap_ctx_o
 );
 
   import ibex_pkg::*;
@@ -554,6 +549,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   logic          tide_csr_rd_dec;
   logic          tide_csr_wait_dec;
   tide_id_trap_t tide_id_trap;
+  logic          tide_irq_ready;
 
   ibex_decoder #(
     .RV32E          (RV32E),
@@ -816,7 +812,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
 
     // TIDE-ISA
     .tide_block_i    (tide_block_dec),
-    .tide_irq_ready_i (tide_irq_ready_o),
+    .tide_irq_ready_i (tide_irq_ready),
     .tide_id_trap_i  (tide_id_trap),
     .tide_trap_i     (tide_trap_i),
     .tide_halt_i     (tide_halt_i),
@@ -858,9 +854,16 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   assign csr_instr_done = ~(stall_ld_hz | stall_mem) &
                           ~flush_id & instr_executing;
 
+  // Without the writeback stage instr_id_done_o is instr_done, which is
+  // csr_instr_done for a CSR instruction (branch/jump/multdiv/TIDE stalls are
+  // logically zero).  With the writeback stage upstream additionally waits for
+  // ready_wb_i; keep that term so WritebackStage=1 configurations retain the
+  // upstream one-cycle write pulse and are not affected by the TIDE timing
+  // change.
   assign csr_op_en_o = csr_access_o & instr_executing &
                        (((BaseIsa == BaseIsaRV32IorCHERIoT) & (cheriot_enable_i == IbexMuBiOn)) ?
-                        instr_first_cycle : csr_instr_done);
+                        instr_first_cycle :
+                        (csr_instr_done & (WritebackStage ? ready_wb_i : 1'b1)));
 
   `ASSERT(CsrOpNotBlocking, csr_access_o |-> ~(tide_block_dec | branch_in_dec |
                                               jump_in_dec | multdiv_en_dec))
@@ -981,16 +984,13 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   // every signal below is constant and the datapath is bit-identical to
   // upstream Ibex (I1).
   //
-  // Local (ID stage) legality checks (ISA ?3.3, ?4.1): unanchored usage of
+  // Local (ID stage) legality checks (ISA section 3.3, section 4.1): unanchored usage of
   // QWAIT/QTRIG/QLOAD, QWAIT phase overflow, QTRIG mask legality. These
   // raise the standard illegal instruction exception (mcause=2, mtval=insn).
   // The enqueue-point checks C2/C3/C4 are evaluated by the DD and reported
   // on tide_enq_rsp (TQ_LATE / TQ_FULL / stall).
 
   // Decoder outputs (see decoder instance)
-
-  // Signals shared with the FSM / register-file writeback path
-  assign tide_id_trap_o = tide_id_trap;
 
   // DD-managed RO CSRs (ISA 5.1): serviced by the DD over the CSR split
   // bus.  The DD registers the request at its input boundary and registers
@@ -1006,7 +1006,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
   typedef enum logic { FIRST_CYCLE, MULTI_CYCLE } id_fsm_e;
   id_fsm_e id_fsm_q, id_fsm_d;
   if (TIDE_EN) begin : g_tide
-    // ---- TLR and anchor state (ch09 ?4.3) ----
+    // ---- TLR and anchor state (ch09 section 4.3) ----
     // TLR is a per-hart bypass register: written only by QWAIT (advance)
     // and by the anchor events (QSYNC release / P2 realignment, reset to 0).
     // It never enters the general register file, forwarding or stalls.
@@ -1039,7 +1039,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     assign tide_tsx    = {1'b0, tide_tlr_q} + {44'b0, tide_pi_id_i};
     assign tide_ts     = tide_tsx[47:0];
 
-    // ---- Local legality (ISA ?3.3, ?4.1) ----
+    // ---- Local legality (ISA section 3.3, section 4.1) ----
     // QWAIT: anchored, TLR + rs1 + imm <= 2^48 - 32 (no overflow/wrap).
     //
     // The check is factored through the registered slack to keep the
@@ -1083,7 +1083,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     assign qload_illegal = ~tide_anchored_q;
 
     // Halted fault domain: new QTRIG/QLOAD/QSYNC -> TQ_HALTED, no block,
-    // no request (ISA ?6.3). QWAIT is not rejected (pure timeline math; it
+    // no request (ISA section 6.3). QWAIT is not rejected (pure timeline math; it
     // still needs an anchor, handled above).
     logic        tide_halted_op;
     assign tide_halted_op = (qtrig_op | qload_op | qsync_op) & tide_halt_i;
@@ -1096,7 +1096,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     // ---- Request generation (level held while the instruction is in ID)
     // A request is only issued when the local checks pass, so a locally
     // illegal instruction never reaches the DD (it is killed on the FLUSH
-    // path before any state change, ISA ?2.5 atomicity).
+    // path before any state change, ISA section 2.5 atomicity).
     //
     // The DD registers the enqueue request at its input boundary: the
     // request is captured in its first cycle, the checker accepts it in the
@@ -1132,7 +1132,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     assign tide_rq_pop_o   = '{valid: qload_active, rq_idx: tide_rq_idx_id_i};
     assign tide_sync_req_o = '{valid: qsync_active, gid: tide_gid};
 
-    // ---- Done (retire) and block predicates (ISA ?2.5) ----
+    // ---- Done (retire) and block predicates (ISA section 2.5) ----
     // State change and retire are the same cycle (atomic retire). The
     // block predicate is stateless: kill-and-re-execute == keep waiting.
     // The first cycle (accept cycle) always blocks; the verdict is sampled
@@ -1189,7 +1189,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
       end
     end
 
-    // ---- QWAIT: single-cycle TLR advance (ISA ?4.1) ----
+    // ---- QWAIT: single-cycle TLR advance (ISA section 4.1) ----
     logic        qwait_commit;
     logic [47:0] qwait_room_next;
     assign qwait_commit = qwait_op & ~tide_enc_illegal_id_i & ~qwait_illegal &
@@ -1227,13 +1227,13 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
 
     // ---- QLOAD writeback flag (see rf_wdata_id_mux) ----
     assign tide_qload_wb = tide_qload_done;
-    // ---- Hart-local timeout counters (ISA ?5.4) ----
+    // ---- Hart-local timeout counters (ISA section 5.4) ----
     // One cumulative wall-tick counter for the blocked instruction,
     // identified by PC: the count holds across interrupt/flush of the same
-    // blocked instruction (mret re-execution accumulates, ISA ?2.5
+    // blocked instruction (mret re-execution accumulates, ISA section 2.5
     // equivalence) and restarts when a different instruction blocks or the
     // block is released by normal completion. Measured in dispatch-clock
-    // ticks (same clock domain as DD GC, ch09 ?5.2).
+    // ticks (same clock domain as DD GC, ch09 section 5.2).
     logic        tide_block_q;
     logic        tmo_valid_q;
     logic [31:0] tmo_cnt_q;
@@ -1275,7 +1275,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     // Block duration exceeds the threshold ("blocking exceeds tqrty/tqsyt").
     // At the start of block cycle N the counter holds N-1, so cnt >= thr
     // fires on cycle thr+1, i.e. after thr full ticks of waiting.
-    // 0 = disabled (debug only, ISA ?5.2).
+    // 0 = disabled (debug only, ISA section 5.2).
     logic tmo_rdy, tmo_sync;
     assign tmo_rdy  = qload_active & tmo_valid_q & (tide_tqrty_i != 32'd0) &
                       (tmo_cnt_q >= tide_tqrty_i);
@@ -1323,16 +1323,14 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
     };
 
     // ---- Outputs ----
-    assign tide_tlr_o      = tide_tlr_q;
-    assign tide_anchored_o = tide_anchored_q;
-    assign tide_block_o    = tide_block_dec;
+    assign tide_tlr_o = tide_tlr_q;
     // Controller handshake (ch09 section 6.3 / section 10): an interrupt, debug
     // request or async TIDE trap may be taken while a TIDE instruction is blocked
     // in ID only when the rest of the pipeline is empty (no non-TIDE stall,
     // writeback ready). mepc/dpc then point at the blocked instruction, which
     // is flushed and re-executed after mret/dret (ISA section 2.5).
-    assign tide_irq_ready_o = tide_block_dec & ~(stall_id & ~stall_tide) &
-                              ~stall_wb & ready_wb_i;
+    assign tide_irq_ready = tide_block_dec & ~(stall_id & ~stall_tide) &
+                            ~stall_wb & ready_wb_i;
 
   end else begin : g_no_tide
     assign illegal_insn_tide = 1'b0;
@@ -1346,10 +1344,8 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
                                ts_prime: '0, pc: '0};
     assign tide_rq_pop_o   = '{valid: 1'b0, rq_idx: '0};
     assign tide_sync_req_o = '{valid: 1'b0, gid: '0};
-    assign tide_tlr_o      = 48'h0;
-    assign tide_anchored_o = 1'b0;
-    assign tide_block_o    = 1'b0;
-    assign tide_irq_ready_o = 1'b0;
+    assign tide_tlr_o = 48'h0;
+    assign tide_irq_ready = 1'b0;
     assign tide_id_trap    = '{valid: 1'b0, tqcause: TideTqCauseLate,
                                target_is_queue: 1'b0, target_idx: '0,
                                ts: '0, gid: '0};
@@ -1487,7 +1483,7 @@ module ibex_id_stage import ibex_cheriot_pkg::*; #(
             tide_block_dec: begin
               // TIDE blocking instruction (QTRIG backpressure, QLOAD empty
               // FIFO, QSYNC join, or a pending TIDE error): hold in ID until
-              // the predicate clears or the controller flushes (ISA ??.5).
+              // the predicate clears or the controller flushes (ISA section 2.5).
               id_fsm_d   = MULTI_CYCLE;
               stall_tide = 1'b1;
               rf_we_raw  = rf_we_dec & ~tide_block_dec;

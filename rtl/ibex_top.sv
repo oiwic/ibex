@@ -12,7 +12,7 @@
 /**
  * Top level module of the ibex RISC-V core
  */
-module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; import ibex_tide_pkg::*; #(
+module ibex_top import ibex_pkg::*; import ibex_cheriot_pkg::*; #(
   parameter ibex_pkg::base_isa_e    BaseIsa                      = ibex_pkg::BaseIsaRV32I,
   parameter bit                     PMPEnable                    = 1'b0,
   parameter int unsigned            PMPGranularity               = 0,
